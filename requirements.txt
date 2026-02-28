@@ -6,8 +6,8 @@ google-cloud-run>=0.10.0
 google-cloud-bigquery>=3.17.0
 google-cloud-logging>=3.9.0
 
-# Vertex AI (Gemini 2.5 Flash)
-google-cloud-aiplatform>=1.48.0
+# Gemini SDK
+google-genai>=0.8.0
 
 # Utilities
 python-dotenv>=1.0.0
