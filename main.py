@@ -1,50 +1,43 @@
-"""
-GCP Cloud Run Security Agent CLI
-Entry point for the security agent tool.
-"""
+# file: main.py
 
 import argparse
-from config.settings import settings
+from config import settings
 
-
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="GCP Cloud Run Security Agent CLI",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py --project my-gcp-project --prompt "List all Cloud Run services"
-  python main.py --project my-gcp-project --prompt "Check IAM bindings for service foo"
-        """,
+        description="GCP Security Agent — Cloud Run Public Exposure Scanner"
     )
     parser.add_argument(
         "--project",
         type=str,
-        required=False,
-        help="GCP Project ID (overrides PROJECT_ID from .env)",
+        help="GCP Project ID (overrides PROJECT_ID in .env)",
+        default=None
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        required=True,
-        help="Natural language prompt describing the security task",
+        help='Natural language prompt e.g. "Analyze Cloud Run public exposure"',
+        required=True
     )
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
 
-    # CLI --project flag overrides the value loaded from .env
+    # CLI --project overrides .env PROJECT_ID
     project_id = args.project or settings.PROJECT_ID
 
     if not project_id:
-        raise ValueError(
-            "A GCP Project ID is required. Provide --project or set PROJECT_ID in .env"
-        )
+        raise ValueError("Project ID is required. Pass --project or set PROJECT_ID in .env")
 
     print(f"Agent initialized | Project: {project_id} | Prompt: {args.prompt}")
+    print(f"LLM: {settings.GEMINI_MODEL} @ {settings.VERTEX_AI_LOCATION}")
+    print(f"Traffic lookback: {settings.TRAFFIC_LOOKBACK_DAYS} days")
+    print("---")
+    print("Phase 2 (Cloud Run Scanner) coming next...")
 
 
 if __name__ == "__main__":
     main()
+

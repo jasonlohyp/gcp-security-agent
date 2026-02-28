@@ -1,60 +1,105 @@
-# GCP Cloud Run Security Agent
+# gcp-security-agent
 
-A CLI tool that uses an AI agent (powered by Anthropic Claude) to analyse and
-audit Google Cloud Run deployments and related BigQuery datasets using natural
-language prompts.
+A GCP Cloud Run security agent that autonomously identifies public exposure risks and generates remediation steps. Built with Python, Vertex AI (Gemini 2.5 Flash), and GCP-native tooling.
 
 ---
 
-## Description
+## What It Does
 
-The security agent accepts a natural language prompt and a GCP project ID, then
-executes the relevant GCP API calls to investigate, report on, or remediate
-security findings within Cloud Run and BigQuery. Credentials are sourced from
-Application Default Credentials (ADC) — no API keys are ever hardcoded.
+1. **Scans** all Cloud Run services in a GCP project for public exposure
+2. **Correlates** traffic logs via BigQuery to classify each service as `Safe` or `Risky`
+3. **Generates** a markdown report with plain-language explanations and ready-to-apply `gcloud` fix commands — powered by Gemini 2.5 Flash on Vertex AI
+
+---
+
+## Architecture
+
+```
+User Prompt (CLI)
+      │
+      ▼
+  main.py  ──────────────────────────────────────────┐
+      │                                               │
+      ▼                                               ▼
+cloud_run_scanner.py          traffic_analyzer.py     agent/orchestrator.py
+(Cloud Run API)               (BigQuery log query)    (Gemini 2.5 Flash)
+      │                               │                       │
+      └───────────── findings ────────┘                       │
+                         │                                     │
+                         └──────────── report.md ─────────────┘
+```
+
+---
+
+## Tech Stack
+
+| Component         | Technology                        |
+|-------------------|-----------------------------------|
+| Language          | Python 3.11+                      |
+| LLM               | Gemini 2.5 Flash (Vertex AI)      |
+| Asset Discovery   | Google Cloud Run v2 Python SDK    |
+| Log Analysis      | Google Cloud BigQuery Python SDK  |
+| Auth              | GCP Application Default Credentials (ADC) |
+| IDE               | Google Antigravity                |
+
+---
+
+## Project Structure
+
+```
+gcp-security-agent/
+├── .env.example              ← environment variable template
+├── .gitignore
+├── requirements.txt
+├── README.md
+├── main.py                   ← CLI entry point
+├── config/
+│   └── settings.py           ← env var loader
+├── tools/
+│   ├── __init__.py
+│   ├── cloud_run_scanner.py  ← discovers public Cloud Run services
+│   └── traffic_analyzer.py  ← BQ traffic correlation (Safe/Risky)
+├── agent/
+│   └── orchestrator.py       ← Gemini report synthesis
+└── output/                   ← generated reports (gitignored)
+```
 
 ---
 
 ## Setup
 
-### 1. Clone the repository
+### Prerequisites
+- Python 3.11+
+- GCP project with Cloud Run and BigQuery enabled
+- `gcloud` CLI installed and authenticated
 
+### 1. Clone the repo
 ```bash
-git clone https://github.com/<your-org>/gcp-security-agent.git
+git clone https://github.com/jasonlohyp/gcp-security-agent.git
 cd gcp-security-agent
 ```
 
 ### 2. Create and activate a virtual environment
-
 ```bash
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
-# macOS / Linux
+# macOS/Linux
 source .venv/bin/activate
 ```
 
 ### 3. Install dependencies
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Configure environment variables
-
+### 4. Set up environment variables
 ```bash
 cp .env.example .env
+# Edit .env with your project values
 ```
 
-Edit `.env` and fill in your values:
-
-| Variable      | Description                                        |
-|---------------|----------------------------------------------------|
-| `PROJECT_ID`  | Default GCP project ID (can be overridden via CLI) |
-| `BQ_DATASET`  | BigQuery dataset for security findings             |
-
 ### 5. Authenticate with GCP
-
 ```bash
 gcloud auth application-default login
 ```
@@ -64,58 +109,60 @@ gcloud auth application-default login
 ## Usage
 
 ```bash
-python main.py --project <GCP_PROJECT_ID> --prompt "<natural language task>"
+# Basic scan — project from .env
+python main.py --prompt "Analyze Cloud Run public exposure"
+
+# Override project via CLI
+python main.py --project my-gcp-project --prompt "Analyze Cloud Run public exposure"
+
+# Scope to specific region
+python main.py --project my-gcp-project --prompt "Analyze Cloud Run exposure in europe-west1"
 ```
 
-### Arguments
-
-| Flag        | Required | Description                                              |
-|-------------|----------|----------------------------------------------------------|
-| `--project` | No*      | GCP Project ID. Overrides `PROJECT_ID` in `.env`.        |
-| `--prompt`  | Yes      | Natural language description of the security task.       |
-
-\* Required if `PROJECT_ID` is not set in `.env`.
+Output report is saved to `output/report_{timestamp}.md`.
 
 ---
 
-## Example
+## Auth & Permissions
+
+The agent uses **Application Default Credentials (ADC)** — no service account key files.
+
+Minimum IAM roles required on the target project:
+
+| Role | Purpose |
+|------|---------|
+| `roles/run.viewer` | List Cloud Run services |
+| `roles/bigquery.dataViewer` | Query log tables |
+| `roles/bigquery.jobUser` | Run BQ jobs |
+| `roles/logging.viewer` | Read Cloud Logging |
+| `roles/aiplatform.user` | Call Vertex AI (Gemini) |
+
+---
+
+## Reusability
+
+The agent is environment-agnostic. Switch between projects by swapping `.env` or using the `--project` CLI flag:
 
 ```bash
-python main.py \
-  --project my-gcp-project-123 \
-  --prompt "List all Cloud Run services with unauthenticated access enabled"
-```
+# Personal project
+python main.py --project jason-personal-project --prompt "Analyze Cloud Run exposure"
 
-**Output:**
-
-```
-Agent initialized | Project: my-gcp-project-123 | Prompt: List all Cloud Run services with unauthenticated access enabled
+# Company project (no code changes)
+python main.py --project hm-aiad-prod --prompt "Analyze Cloud Run exposure"
 ```
 
 ---
 
-## Project Structure
+## Dry Run Policy
 
-```
-gcp-security-agent/
-├── .env.example        # Template for environment variables
-├── .gitignore          # Python + GCP credential exclusions
-├── requirements.txt    # Python dependencies
-├── README.md           # This file
-├── main.py             # CLI entry point
-├── config/
-│   ├── __init__.py
-│   └── settings.py     # Loads env vars via python-dotenv
-└── tools/
-    └── __init__.py     # Tools package (extend with GCP API wrappers)
-```
+**No changes are applied automatically.** The agent outputs `gcloud` commands and Terraform snippets for human review. Apply only after validating the report.
 
 ---
 
-## Security Notes
+## Roadmap
 
-- **Never commit `.env`** — it is listed in `.gitignore`.
-- **Never commit GCP service account JSON keys** — all `*.json` files (except
-  `package.json`) are excluded by `.gitignore`.
-- Use [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
-  or Workload Identity for production deployments.
+- [x] Phase 1 — Scaffold + Auth
+- [ ] Phase 2 — Cloud Run Scanner
+- [ ] Phase 3 — Traffic Correlation (BigQuery)
+- [ ] Phase 4 — Gemini Report + Remediation Output
+- [ ] Phase 5 — IAM Basic Roles use case

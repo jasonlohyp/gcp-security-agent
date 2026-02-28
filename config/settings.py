@@ -1,30 +1,20 @@
-"""
-Application settings loaded from environment variables via python-dotenv.
-"""
+# file: config/settings.py
 
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from the project root (two levels up from this file)
-_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=_ENV_PATH)
+load_dotenv()
 
+# GCP Project — overridable via CLI --project flag
+PROJECT_ID = os.getenv("PROJECT_ID", "")
 
-class _Settings:
-    """Centralised settings object.
+# BigQuery log configuration
+BQ_DATASET = os.getenv("BQ_DATASET", "")
+BQ_LOG_TABLE = os.getenv("BQ_LOG_TABLE", "cloudrun_googleapis_com_requests")
 
-    Values are read once at import time from the environment.
-    The --project CLI flag in main.py takes precedence over PROJECT_ID.
-    """
+# Vertex AI / Gemini configuration
+VERTEX_AI_LOCATION = os.getenv("VERTEX_AI_LOCATION", "europe-west1")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-    PROJECT_ID: str = os.getenv("PROJECT_ID", "")
-    BQ_DATASET: str = os.getenv("BQ_DATASET", "")
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return (
-            f"Settings(PROJECT_ID={self.PROJECT_ID!r}, BQ_DATASET={self.BQ_DATASET!r})"
-        )
-
-
-settings = _Settings()
+# Traffic analysis window (days)
+TRAFFIC_LOOKBACK_DAYS = int(os.getenv("TRAFFIC_LOOKBACK_DAYS", "30"))

@@ -1,5 +1,13 @@
-google-auth>=2.29.0
+# gcp-security-agent requirements
+
+# GCP SDKs
+google-auth>=2.28.0
 google-cloud-run>=0.10.0
-google-cloud-bigquery>=3.20.0
-python-dotenv>=1.0.1
-anthropic>=0.25.0
+google-cloud-bigquery>=3.17.0
+google-cloud-logging>=3.9.0
+
+# Vertex AI (Gemini 2.5 Flash)
+google-cloud-aiplatform>=1.48.0
+
+# Utilities
+python-dotenv>=1.0.0
