@@ -65,13 +65,15 @@ def main():
     projects = resolve_projects(project_id=project_id, folder_id=folder_id, org_id=org_id)
     
     # Apply project cap
-    if args.max_projects and len(projects) > args.max_projects:
-        print(f"WARNING: Capped to {args.max_projects} of {len(projects)} resolved projects.")
-        projects = projects[:args.max_projects]
+    max_projects = args.max_projects or settings.MAX_PROJECTS
+    if max_projects and len(projects) > max_projects:
+        print(f"WARNING: Capped to {max_projects} of {len(projects)} resolved projects.")
+        projects = projects[:max_projects]
     
     print(f"Agent initialized | Prompt: {args.prompt}")
     print(f"Scope: {len(projects)} project(s) resolved")
     print(f"LLM: {settings.GEMINI_MODEL} @ {settings.VERTEX_AI_LOCATION}")
+    print(f"Traffic lookback: {settings.TRAFFIC_LOOKBACK_DAYS} days")
     print(f"Parallel workers: {settings.MAX_WORKERS}")
     print("---")
     
