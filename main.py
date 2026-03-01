@@ -5,6 +5,7 @@ from config import settings
 from tools.cloud_run_scanner import scan_cloud_run_services
 from tools.project_resolver import resolve_projects
 from tools.cost_estimator import estimate_scan, print_dry_run_summary
+from tools.traffic_analyzer import analyze_traffic
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -47,6 +48,12 @@ def parse_args():
         help="Cap the number of projects to scan",
         default=None
     )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip interactive confirmation prompts"
+    )
     
     return parser.parse_args()
 
@@ -73,39 +80,66 @@ def main():
     print(f"Agent initialized | Prompt: {args.prompt}")
     print(f"Scope: {len(projects)} project(s) resolved")
     print(f"LLM: {settings.GEMINI_MODEL} @ {settings.VERTEX_AI_LOCATION}")
-    print(f"Traffic lookback: {settings.TRAFFIC_LOOKBACK_DAYS} days")
+    print(f"Traffic lookback: {settings.LOG_LOOKBACK_DAYS} days")
     print(f"Parallel workers: {settings.MAX_WORKERS}")
     print("---")
     
     all_findings = []
     
-    # Parallel Project Scan
-    print(f"Scanning {len(projects)} projects for public Cloud Run services...")
-    with ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
-        future_to_pid = {executor.submit(scan_cloud_run_services, pid): pid for pid in projects}
-        
-        for future in as_completed(future_to_pid):
-            pid = future_to_pid[future]
-            try:
-                findings = future.result()
-                all_findings.extend(findings)
-                print(f"✓ Scanned project: {pid} — {len(findings)} public services found")
-            except Exception as e:
-                print(f"✗ FAILED to scan project {pid}: {e}")
+    # Discovery: Parallel if many projects, else sequential
+    if len(projects) > 1:
+        print(f"Scanning {len(projects)} projects for public Cloud Run services (Parallel)...")
+        with ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
+            future_to_pid = {executor.submit(scan_cloud_run_services, pid): pid for pid in projects}
+            for future in as_completed(future_to_pid):
+                pid = future_to_pid[future]
+                try:
+                    findings = future.result()
+                    all_findings.extend(findings)
+                    print(f"✓ Scanned project: {pid} — {len(findings)} public services found")
+                except Exception as e:
+                    print(f"✗ FAILED to scan project {pid}: {e}")
+    else:
+        pid = projects[0]
+        print(f"Scanning project: {pid}...")
+        try:
+            findings = scan_cloud_run_services(pid)
+            all_findings.extend(findings)
+            print(f"✓ Scanned project: {pid} — {len(findings)} public services found")
+        except Exception as e:
+            print(f"✗ FAILED to scan project {pid}: {e}")
     
     # Cost Estimation & Dry-Run flow
     estimate = estimate_scan(projects, all_findings)
     
     if args.dry_run:
         print_dry_run_summary(estimate)
-        confirm = input("Proceed with Phase 3 (Traffic Analysis)? [y/N]: ").strip().lower()
-        if confirm != 'y':
-            print("Scan aborted by user.")
-            sys.exit(0)
+        if not args.yes:
+            confirm = input("Proceed with Phase 3 (Traffic Analysis)? [y/N]: ").strip().lower()
+            if confirm != 'y':
+                print("Scan aborted by user.")
+                sys.exit(0)
+        else:
+            print("Auto-proceeding (--yes flag set)...")
     
     if not all_findings:
         print("\nNo public Cloud Run services found across the resolved scope.")
         return
+
+    # Phase 3: Traffic Correlation
+    print(f"\nAnalyzing traffic for {len(all_findings)} public services...")
+    for f in all_findings:
+        # Extract project, service, and region
+        project_id = f['full_name'].split('/')[1]
+        service_name = f['name']
+        region = f['region']
+        
+        traffic_result = analyze_traffic(project_id, service_name, region, settings.LOG_LOOKBACK_DAYS)
+        
+        # Enrich finding
+        f['request_count'] = traffic_result['request_count']
+        f['classification'] = traffic_result['classification']
+        f['last_request_date'] = traffic_result['last_request_date']
 
     # 1. Define columns and extract project names
     rows = []
@@ -118,10 +152,12 @@ def main():
             "REGION": f['region'],
             "INGRESS": f['ingress'],
             "UNAUTH?": unauth_str,
+            "REQUESTS (30d)": str(f['request_count']),
+            "CLASSIFICATION": f['classification'],
             "REASON": f['public_reason']
         })
 
-    keys = ["PROJECT", "SERVICE", "REGION", "INGRESS", "UNAUTH?", "REASON"]
+    keys = ["PROJECT", "SERVICE", "REGION", "INGRESS", "UNAUTH?", "REQUESTS (30d)", "CLASSIFICATION", "REASON"]
     
     # 2. Calculate max widths
     widths = {k: len(k) for k in keys}
@@ -139,7 +175,7 @@ def main():
         print(line)
     
     print(f"\nFound {len(all_findings)} public services across {len(projects)} projects.")
-    print("Phase 3 (Traffic Correlation) would start now in a full run.")
+    print("Phase 4 (Gemini Report Synthesis) would start now in a full run.")
 
 if __name__ == "__main__":
     main()

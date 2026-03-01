@@ -9,7 +9,7 @@ A GCP Cloud Run security agent that autonomously identifies public exposure risk
 1. **Resolves** target projects — single project, folder, or entire org
 2. **Scans** all Cloud Run services in parallel for public exposure
 3. **Estimates** cost and scope before running expensive operations (dry-run mode)
-4. **Correlates** traffic logs via BigQuery to classify each service as `Safe` or `Risky`
+4. **Correlates** traffic logs via Cloud Logging to classify each service as `Safe` or `Risky`
 5. **Generates** a markdown report with plain-language explanations and ready-to-apply `gcloud` fix commands — powered by Gemini 2.5 Flash on Vertex AI
 
 ---
@@ -30,11 +30,11 @@ CLI Input (--project | --folder | --org)
   cloud_run_scanner.py         ← Cloud Run Admin API per project
           │
           ▼
-  cost_estimator.py            ← scope + BQ cost estimate
-  [--dry-run gate]             ← user confirms before BQ queries run
+  cost_estimator.py            ← scope + scan runtime estimate
+  [--dry-run gate]             ← user confirms before traffic analysis
           │
           ▼
-  traffic_analyzer.py          ← BigQuery log correlation (Safe/Risky)
+  traffic_analyzer.py          ← Cloud Logging correlation (Safe/Risky)
           │
           ▼
   agent/orchestrator.py        ← Gemini 2.5 Flash report synthesis
@@ -53,7 +53,7 @@ CLI Input (--project | --folder | --org)
 | LLM                | Gemini 2.5 Flash (Vertex AI)            |
 | Asset Discovery    | Google Cloud Run v2 Python SDK          |
 | Project Resolution | Google Cloud Resource Manager v3 SDK    |
-| Log Analysis       | Google Cloud BigQuery Python SDK        |
+| Log Analysis       | Google Cloud Logging Python SDK         |
 | Concurrency        | Python `concurrent.futures` (stdlib)    |
 | Auth               | GCP Application Default Credentials     |
 | IDE                | Google Antigravity                      |
@@ -75,8 +75,8 @@ gcp-security-agent/
 │   ├── __init__.py
 │   ├── project_resolver.py       ← resolves project list (project/folder/org)
 │   ├── cloud_run_scanner.py      ← discovers public Cloud Run services
-│   ├── cost_estimator.py         ← dry-run scope + BQ cost estimation
-│   └── traffic_analyzer.py       ← BQ traffic correlation (Safe/Risky)
+│   ├── cost_estimator.py         ← dry-run scope + runtime estimation
+│   └── traffic_analyzer.py       ← Cloud Logging correlation (Safe/Risky)
 ├── agent/
 │   └── orchestrator.py           ← Gemini report synthesis
 └── output/                       ← generated reports (gitignored)
@@ -88,7 +88,7 @@ gcp-security-agent/
 
 ### Prerequisites
 - Python 3.11+
-- GCP project with Cloud Run and BigQuery enabled
+- GCP project with Cloud Run and Cloud Logging enabled
 - `gcloud` CLI installed and authenticated
 
 ### 1. Clone the repo
@@ -174,9 +174,7 @@ Resolved 134 projects to scan
 ╠══════════════════════════════════════╣
 ║ Projects to scan       : 134         ║
 ║ Public services found  : 12          ║
-║ BQ queries to run      : 12          ║
-║ Estimated BQ scanned   : 6.0 GB      ║
-║ Estimated BQ cost      : $0.03       ║
+║ Traffic analysis days  : 30          ║
 ║ Estimated run time     : ~1.3 mins   ║
 ╚══════════════════════════════════════╝
 
@@ -194,9 +192,7 @@ Minimum IAM roles required:
 | Role | Purpose | Scope |
 |------|---------|-------|
 | `roles/run.viewer` | List Cloud Run services | Per project |
-| `roles/bigquery.dataViewer` | Query log tables | Per project |
-| `roles/bigquery.jobUser` | Run BQ jobs | Per project |
-| `roles/logging.viewer` | Read Cloud Logging | Per project |
+| `roles/logging.viewer` | Read Cloud Logging request logs | Per project |
 | `roles/aiplatform.user` | Call Vertex AI (Gemini) | Per project |
 | `roles/resourcemanager.folderViewer` | List projects under a folder | Folder level |
 | `roles/resourcemanager.organizationViewer` | List all projects in the org | Org level |
@@ -208,9 +204,10 @@ Minimum IAM roles required:
 | Mechanism | Detail |
 |---|---|
 | **Parallel scanning** | `ThreadPoolExecutor` with 10 workers — ~10x faster than sequential |
-| **BQ cost guard** | `--dry-run` shows estimated GB scanned + USD cost before any queries run |
+| **Dry-Run gate** | `--dry-run` shows scope + runtime before traffic analysis starts |
 | **Project cap** | `--max-projects` limits scope during testing or staged rollouts |
-| **Selective BQ queries** | Phase 3 only queries logs for public services found — not all projects |
+| **Log Filtering** | Phase 3 filters Logging by project/region/service + 30d window |
+| **Small-Scale Safety** | Sequential scanning used for single projects (prevents SDK hangs) |
 | **Single LLM call** | Gemini is called once per run regardless of project count |
 
 ---
@@ -239,6 +236,6 @@ python main.py --org HM_ORG_ID --prompt "Analyze Cloud Run exposure across all p
 
 - [x] Phase 1 — Scaffold + Auth
 - [x] Phase 2 — Cloud Run Scanner + Performance Guards
-- [ ] Phase 3 — Traffic Correlation (BigQuery)
+- [x] Phase 3 — Traffic Correlation (Cloud Logging)
 - [ ] Phase 4 — Gemini Report + Remediation Output
 - [ ] Phase 5 — IAM Basic Roles use case
