@@ -1,202 +1,181 @@
+# file: main.py
+# GCP Cloud Run Security Agent — CLI entry point
+# Pipeline: resolve → scan → traffic → classify → remediate → report
+
 import argparse
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 from config import settings
-from tools.cloud_run_scanner import scan_cloud_run_services
 from tools.project_resolver import resolve_projects
-from tools.cost_estimator import estimate_scan, print_dry_run_summary
+from tools.cloud_run_scanner import scan_cloud_run_services
 from tools.traffic_analyzer import analyze_traffic
+from tools.risk_classifier import classify_service, summarise_findings
+from tools.remediation_templates import get_remediation
+from tools.cost_estimator import estimate_scan, print_dry_run_summary
 from agent.orchestrator import generate_report, save_report
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="GCP Security Agent — Cloud Run Public Exposure Scanner"
     )
-    
-    # Mutually exclusive group for project selection
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--project",
-        help="GCP Project ID (overrides PROJECT_ID in .env)",
-        default=None
-    )
-    group.add_argument(
-        "--folder",
-        help="GCP Folder ID to scan (resolves child projects)",
-        default=None
-    )
-    group.add_argument(
-        "--org",
-        help="GCP Organization ID to scan (resolves all active projects)",
-        default=None
-    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--project", type=str, help="Single GCP project ID")
+    scope.add_argument("--folder", type=str, help="GCP folder ID — scans all projects under it")
+    scope.add_argument("--org", type=str, help="GCP org ID — scans all projects in the org")
 
-    parser.add_argument(
-        "--prompt",
-        help='Natural language prompt e.g. "Analyze Cloud Run public exposure"',
-        required=True
-    )
-
-    # Production Guards
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Estimate costs and scope before proceeding"
-    )
-    parser.add_argument(
-        "--max-projects",
-        type=int,
-        help="Cap the number of projects to scan",
-        default=None
-    )
-    parser.add_argument(
-        "--yes",
-        "-y",
-        action="store_true",
-        help="Skip interactive confirmation prompts"
-    )
-    
+    parser.add_argument("--prompt", type=str, required=True, help="Natural language prompt")
+    parser.add_argument("--dry-run", action="store_true", help="Estimate scope and cost without running LLM")
+    parser.add_argument("--max-projects", type=int, default=settings.MAX_PROJECTS, help="Cap number of projects to scan")
     return parser.parse_args()
+
+
+def print_findings_table(findings: list[dict]):
+    """Prints dynamically aligned findings table to terminal."""
+    if not findings:
+        return
+
+    headers = ["PROJECT", "SERVICE", "REGION", "INGRESS", "UNAUTH?", "REQUESTS", "RISK LEVEL", "CATEGORY"]
+    rows = [
+        [
+            f.get("project_id", ""),
+            f.get("name", ""),
+            f.get("region", ""),
+            f.get("ingress", ""),
+            "YES" if f.get("unauthenticated") else "NO",
+            str(f.get("request_count", "N/A")),
+            f.get("risk_level", ""),
+            f.get("risk_category", ""),
+        ]
+        for f in findings
+    ]
+
+    col_widths = [
+        max(len(h), max((len(r[i]) for r in rows), default=0))
+        for i, h in enumerate(headers)
+    ]
+
+    def format_row(row):
+        return " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row))
+
+    separator = "-" * (sum(col_widths) + 3 * (len(headers) - 1))
+    print(format_row(headers))
+    print(separator)
+    for row in rows:
+        print(format_row(row))
+
 
 def main():
     args = parse_args()
 
-    # Determine scope: CLI arg > .env > None
-    project_id = args.project or (settings.PROJECT_ID if not any([args.folder, args.org]) else None)
-    folder_id = args.folder or (settings.FOLDER_ID if not any([args.project, args.org]) else None)
-    org_id = args.org or (settings.ORG_ID if not any([args.project, args.folder]) else None)
+    # Resolve primary project for Vertex AI auth
+    primary_project = args.project or settings.PROJECT_ID
+    if not primary_project:
+        raise ValueError("Project ID required for Vertex AI. Pass --project or set PROJECT_ID in .env")
 
-    if not any([project_id, folder_id, org_id]):
-        raise ValueError("GCP scope is required. Pass --project, --folder, or --org (or set defaults in .env)")
-
-    # Resolve projects
-    projects = resolve_projects(project_id=project_id, folder_id=folder_id, org_id=org_id)
-    
-    # Apply project cap
-    max_projects = args.max_projects or settings.MAX_PROJECTS
-    if max_projects and len(projects) > max_projects:
-        print(f"WARNING: Capped to {max_projects} of {len(projects)} resolved projects.")
-        projects = projects[:max_projects]
-    
-    print(f"Agent initialized | Prompt: {args.prompt}")
-    print(f"Scope: {len(projects)} project(s) resolved")
-    print(f"LLM: {settings.GEMINI_MODEL} @ {settings.VERTEX_AI_LOCATION}")
-    print(f"Traffic lookback: {settings.LOG_LOOKBACK_DAYS} days")
-    print(f"Parallel workers: {settings.MAX_WORKERS}")
-    print("---")
-    
-    all_findings = []
-    
-    # Discovery: Parallel if many projects, else sequential
-    if len(projects) > 1:
-        print(f"Scanning {len(projects)} projects for public Cloud Run services (Parallel)...")
-        with ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
-            future_to_pid = {executor.submit(scan_cloud_run_services, pid): pid for pid in projects}
-            for future in as_completed(future_to_pid):
-                pid = future_to_pid[future]
-                try:
-                    findings = future.result()
-                    all_findings.extend(findings)
-                    print(f"✓ Scanned project: {pid} — {len(findings)} public services found")
-                except Exception as e:
-                    print(f"✗ FAILED to scan project {pid}: {e}")
+    # Determine scope label
+    if args.project:
+        project_scope = f"project:{args.project}"
+    elif args.folder:
+        project_scope = f"folder:{args.folder}"
+    elif args.org:
+        project_scope = f"org:{args.org}"
     else:
-        pid = projects[0]
-        print(f"Scanning project: {pid}...")
-        try:
-            findings = scan_cloud_run_services(pid)
-            all_findings.extend(findings)
-            print(f"✓ Scanned project: {pid} — {len(findings)} public services found")
-        except Exception as e:
-            print(f"✗ FAILED to scan project {pid}: {e}")
-    
-    # Cost Estimation & Dry-Run flow
-    estimate = estimate_scan(projects, all_findings)
-    
+        project_scope = f"project:{primary_project}"
+
+    print(f"Agent initialized | Scope: {project_scope} | Prompt: {args.prompt}")
+    print(f"LLM: {settings.GEMINI_MODEL} @ {settings.VERTEX_AI_LOCATION}")
+    print(f"Traffic lookback: {settings.TRAFFIC_LOOKBACK_DAYS} days")
+    print("---")
+
+    # Step 1: Resolve projects
+    project_ids = resolve_projects(
+        project_id=args.project,
+        folder_id=args.folder,
+        org_id=args.org,
+    )
+    print(f"Resolved {len(project_ids)} project(s) to scan")
+
+    # Step 2: Apply project cap
+    if args.max_projects and len(project_ids) > args.max_projects:
+        print(f"Warning: capped to {args.max_projects} of {len(project_ids)} resolved projects")
+        project_ids = project_ids[:args.max_projects]
+
+    # Step 3: Parallel Cloud Run scan
+    print(f"\nScanning {len(project_ids)} project(s) for public Cloud Run services...")
+    all_findings = []
+
+    with ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
+        futures = {executor.submit(scan_cloud_run_services, pid): pid for pid in project_ids}
+        for i, future in enumerate(as_completed(futures), 1):
+            pid = futures[future]
+            try:
+                findings = future.result()
+                print(f"✓ Scanned: {pid} — {len(findings)} public service(s) found ({i}/{len(project_ids)})")
+                for f in findings:
+                    f["project_id"] = pid
+                all_findings.extend(findings)
+            except Exception as e:
+                print(f"✗ Failed: {pid} — {e}")
+
+    # Step 4: Dry-run gate
+    estimate = estimate_scan(project_ids, all_findings)
     if args.dry_run:
         print_dry_run_summary(estimate)
-        if not args.yes:
-            confirm = input("Proceed with Phase 3 (Traffic Analysis)? [y/N]: ").strip().lower()
-            if confirm != 'y':
-                print("Scan aborted by user.")
-                sys.exit(0)
-        else:
-            print("Auto-proceeding (--yes flag set)...")
-    
-    if not all_findings:
-        print("\nNo public Cloud Run services found across the resolved scope.")
+        confirm = input("\nProceed with full scan? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("Dry run complete. No changes made.")
+            return
+
+    # Step 5: Traffic analysis
+    print(f"\nAnalyzing traffic for {len(all_findings)} public service(s)...")
+    for finding in all_findings:
+        traffic = analyze_traffic(
+            project_id=finding["project_id"],
+            service_name=finding["name"],
+            region=finding["region"],
+            lookback_days=settings.TRAFFIC_LOOKBACK_DAYS,
+        )
+        finding.update(traffic)
+        print(f"✓ {finding['name']} — {finding.get('request_count', 0)} requests | {finding.get('classification', 'Unknown')}")
+
+    # Step 6: Deterministic risk classification — zero LLM cost
+    print("\nClassifying risk levels...")
+    classified = [classify_service(f) for f in all_findings]
+
+    # Step 7: Generate remediation commands — zero LLM cost
+    for finding in classified:
+        finding["remediation"] = get_remediation(finding)
+
+    # Step 8: Print findings table
+    print()
+    if classified:
+        print_findings_table(classified)
+    else:
+        print(f"No public Cloud Run services found in scope: {project_scope}")
         return
 
-    # Phase 3: Traffic Correlation
-    print(f"\nAnalyzing traffic for {len(all_findings)} public services...")
-    for f in all_findings:
-        # Extract project, service, and region
-        project_id = f['full_name'].split('/')[1]
-        service_name = f['name']
-        region = f['region']
-        
-        traffic_result = analyze_traffic(project_id, service_name, region, settings.LOG_LOOKBACK_DAYS)
-        
-        # Enrich finding
-        f['request_count'] = traffic_result['request_count']
-        f['classification'] = traffic_result['classification']
-        f['last_request_date'] = traffic_result['last_request_date']
+    # Step 9: Summary counts
+    summary = summarise_findings(classified)
+    print(f"\nScan complete | {summary['total']} public service(s) | "
+          f"Critical: {summary['Critical']} | High: {summary['High']} | "
+          f"Medium: {summary['Medium']} | Needs remediation: {summary['needs_remediation']}")
 
-    # 1. Define columns and extract project names
-    rows = []
-    for f in all_findings:
-        found_project = f['full_name'].split('/')[1]
-        unauth_str = "YES" if f['unauthenticated'] else "NO"
-        rows.append({
-            "PROJECT": found_project,
-            "SERVICE": f['name'],
-            "REGION": f['region'],
-            "INGRESS": f['ingress'],
-            "UNAUTH?": unauth_str,
-            "REQUESTS (30d)": str(f['request_count']),
-            "CLASSIFICATION": f['classification'],
-            "REASON": f['public_reason']
-        })
-
-    keys = ["PROJECT", "SERVICE", "REGION", "INGRESS", "UNAUTH?", "REQUESTS (30d)", "CLASSIFICATION", "REASON"]
-    
-    # 2. Calculate max widths
-    widths = {k: len(k) for k in keys}
-    for row in rows:
-        for k in keys:
-            widths[k] = max(widths[k], len(str(row[k])))
-
-    # 3. Print table
-    header = " | ".join(k.ljust(widths[k]) for k in keys)
-    print("\n" + header)
-    print("-" * (sum(widths.values()) + (len(keys) - 1) * 3))
-    
-    for row in rows:
-        line = " | ".join(str(row[k]).ljust(widths[k]) for k in keys)
-        print(line)
-    
-    print(f"\nFound {len(all_findings)} public services across {len(projects)} projects.")
-    
-    # Phase 4: Gemini Report Synthesis
-    print(f"\nGenerating security report with Gemini 2.5 Flash...")
-    # Determine project scope string for filename
-    if args.project:
-        project_scope = args.project
-    elif args.folder:
-        project_scope = f"folder_{args.folder}"
-    elif args.org:
-        project_scope = f"org_{args.org}"
-    else:
-        project_scope = "default"
-
-    report = generate_report(all_findings, project_scope, args.prompt)
+    # Step 10: Single Gemini call — synthesize report only
+    print(f"\nGenerating security report with {settings.GEMINI_MODEL}...")
+    report = generate_report(
+        classified_findings=classified,
+        summary=summary,
+        project_scope=project_scope,
+        user_prompt=args.prompt,
+        project_id=primary_project,
+    )
     report_path = save_report(report, project_scope)
-    
-    # Calculate risky vs safe for final summary
-    risky_count = len([f for f in all_findings if f['classification'] == 'Risky'])
-    
     print(f"Report saved to: {report_path}")
-    print(f"\nScan complete | {len(projects)} projects scanned | {len(all_findings)} public services | {risky_count} risky | Report: {report_path}")
+
 
 if __name__ == "__main__":
     main()

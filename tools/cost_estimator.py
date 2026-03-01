@@ -1,43 +1,51 @@
 # file: tools/cost_estimator.py
+# Dry-run scope estimator for the GCP Security Agent.
+# Cloud Logging API is free — no cost estimation needed.
+# This module estimates run time and scope only.
 
 from config import settings
 
+
 def estimate_scan(project_ids: list[str], findings: list[dict]) -> dict:
     """
-    Calculates a rough estimate of the scan runtime.
-    BQ cost estimation removed as direct Logging is used for PoC.
+    Estimates the scope and run time of a full scan.
+    Cloud Logging API is free so no cost estimate is needed.
+
+    Args:
+        project_ids: List of resolved project IDs to scan
+        findings: Public Cloud Run services found by the scanner
+
+    Returns:
+        dict with scope and time estimates
     """
     project_count = len(project_ids)
-    public_services_found = len(findings)
-    
-    # Heuristic: 3 seconds per project discovery / concurrency factor
-    base_time_per_project = 3 
-    estimated_run_time_mins = (project_count * base_time_per_project) / (settings.MAX_WORKERS * 60)
-    
+    public_services = len(findings)
+
+    # Estimate run time: 3s per project divided by parallel workers
+    estimated_run_time_mins = round(
+        (project_count * 3) / (settings.MAX_WORKERS * 60), 1
+    )
+
     return {
         "project_count": project_count,
-        "public_services_found": public_services_found,
-        "estimated_run_time_mins": max(0.1, estimated_run_time_mins) # Min 6 seconds
+        "public_services_found": public_services,
+        "logging_queries_to_run": public_services,
+        "estimated_run_time_mins": estimated_run_time_mins,
     }
 
+
 def print_dry_run_summary(estimate: dict):
-    """
-    Prints the dry-run summary table to the terminal.
-    """
-    print("\n" + "="*50)
+    """Prints a clean dry-run summary table to terminal."""
+    width = 44
+    print()
+    print("=" * width)
     print(" DRY-RUN ESTIMATION SUMMARY")
-    print("="*50)
-    
-    rows = [
-        ("Projects to scan", f"{estimate['project_count']}"),
-        ("Public services found", f"{estimate['public_services_found']}"),
-        ("Estimated remaining time", f"{estimate['estimated_run_time_mins']:.1f} mins"),
-    ]
-    
-    for label, value in rows:
-        print(f"{label:<28} : {value}")
-    
-    print("="*50)
-    print("NOTICE: Cloud Logging queries are used for traffic analysis (no BQ cost).")
-    print("Estimated time covers Cloud Run discovery only.")
-    print("="*50 + "\n")
+    print("=" * width)
+    print(f" Projects to scan          : {estimate['project_count']}")
+    print(f" Public services found     : {estimate['public_services_found']}")
+    print(f" Logging queries to run    : {estimate['logging_queries_to_run']}")
+    print(f" Estimated run time        : {estimate['estimated_run_time_mins']} mins")
+    print("=" * width)
+    print(" NOTE: Cloud Logging API is free.")
+    print(" Cost: ~$0.01 flat for the Gemini report call.")
+    print("=" * width)

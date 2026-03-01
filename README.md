@@ -1,6 +1,6 @@
 # gcp-security-agent
 
-A GCP Cloud Run security agent that autonomously identifies public exposure risks and generates remediation steps. Built with Python, Vertex AI (Gemini 2.5 Flash), and GCP-native tooling. Designed to scale from a single project to an entire GCP organization.
+A GCP Cloud Run security agent that autonomously identifies public exposure risks, classifies them against a structured risk matrix, and generates remediation steps. Built with Python, Vertex AI (Gemini 2.5 Flash), and GCP-native tooling. Scales from a single project to an entire GCP organization.
 
 ---
 
@@ -8,9 +8,11 @@ A GCP Cloud Run security agent that autonomously identifies public exposure risk
 
 1. **Resolves** target projects — single project, folder, or entire org
 2. **Scans** all Cloud Run services in parallel for public exposure
-3. **Estimates** cost and scope before running expensive operations (dry-run mode)
-4. **Correlates** traffic logs via Cloud Logging to classify each service as `Safe` or `Risky`
-5. **Generates** a markdown report with plain-language explanations and ready-to-apply `gcloud` fix commands — powered by Gemini 2.5 Flash on Vertex AI
+3. **Estimates** cost and scope before running (dry-run mode)
+4. **Correlates** traffic logs via Cloud Logging API to enrich findings
+5. **Classifies** each service against a 6-tier risk matrix — pure Python, zero LLM cost
+6. **Generates** ready-to-copy `gcloud` remediation commands per risk category — zero LLM cost
+7. **Synthesizes** a single Gemini 2.5 Flash call to produce a narrative markdown report
 
 ---
 
@@ -20,43 +22,110 @@ A GCP Cloud Run security agent that autonomously identifies public exposure risk
 CLI Input (--project | --folder | --org)
           │
           ▼
-  project_resolver.py          ← resolves project list from GCP Resource Manager
+  project_resolver.py          ← GCP Resource Manager API
           │
           ▼
-  [--max-projects cap]         ← safety cap to limit scope
+  [--max-projects cap]
           │
           ▼
-  ThreadPoolExecutor           ← parallel scan (max 10 workers)
-  cloud_run_scanner.py         ← Cloud Run Admin API per project
+  ThreadPoolExecutor            ← parallel scan (10 workers)
+  cloud_run_scanner.py          ← Cloud Run Admin API
           │
           ▼
-  cost_estimator.py            ← scope + scan runtime estimate
-  [--dry-run gate]             ← user confirms before traffic analysis
+  cost_estimator.py + [--dry-run gate]
           │
           ▼
-  traffic_analyzer.py          ← Cloud Logging correlation (Safe/Risky)
+  traffic_analyzer.py           ← Cloud Logging API
           │
           ▼
-  agent/orchestrator.py        ← Gemini 2.5 Flash report synthesis
+  risk_classifier.py            ← deterministic Python — zero LLM cost
+          │      ▲
+          │      └── reads logic from config/risk_matrix.md
+          ▼
+  remediation_templates.py      ← Jinja2 gcloud commands — zero LLM cost
           │
           ▼
-  output/report_{timestamp}.md ← remediation report
+  orchestrator.py               ← ONE Gemini 2.5 Flash call
+          │      ▲
+          │      └── reads config/risk_matrix.md as system prompt context
+          ▼
+  output/report_{scope}_{ts}.md
 ```
+
+---
+
+## How the LLM is Used
+
+The LLM (Gemini 2.5 Flash) plays a **narrow, well-defined role** — it is a report synthesizer, not a decision maker. All security decisions happen in Python before the LLM is ever called.
+
+### What Gemini does NOT do
+- ❌ Classify risk — handled by `risk_classifier.py` (pure Python)
+- ❌ Determine ingress/auth/SA issues — handled by `cloud_run_scanner.py`
+- ❌ Generate `gcloud` commands — handled by `remediation_templates.py` (Jinja2)
+- ❌ Query logs or APIs — handled by `traffic_analyzer.py`
+
+### What Gemini DOES do (one call per run)
+- ✅ Writes the executive summary in plain language
+- ✅ Explains in plain English *why* each service is risky based on pre-computed triggered dimensions
+- ✅ Presents pre-computed remediation commands in the report exactly as provided
+- ✅ Adds strategic recommendations based on patterns across all findings
+
+### Why this design?
+Keeping classification deterministic (Python) and synthesis separate (LLM) means:
+- **Consistent results** — same inputs always produce the same risk category
+- **Auditable logic** — risk rules live in `config/risk_matrix.md`, readable by anyone
+- **Cost efficient** — one LLM call at ~$0.01 regardless of how many projects or services are scanned
+- **No hallucination risk on facts** — Gemini only narrates, never decides
+
+---
+
+## Key File Responsibilities
+
+| File | Role | Uses LLM? |
+|---|---|---|
+| `config/risk_matrix.md` | Single source of truth for risk classification logic. Read by both `risk_classifier.py` (as code reference) and `orchestrator.py` (injected into Gemini system prompt). Update this file to evolve security standards — no code changes needed. | No |
+| `tools/risk_classifier.py` | Pure Python 6-tier risk classifier. Reads each finding's ingress, auth, SA, and traffic data and assigns a risk category. Called in `main.py` for every finding before the LLM is invoked. | No |
+| `tools/remediation_templates.py` | Jinja2 templates that generate ready-to-copy `gcloud` fix commands per risk category. Output stored in `finding["remediation"]` and passed to Gemini as pre-computed context — Gemini presents them, never rewrites them. | No |
+| `agent/orchestrator.py` | The only file that calls Gemini. Receives fully classified and remediated findings, loads `risk_matrix.md` as system context, and asks Gemini to write a narrative report. One API call per run. | ✅ Yes — once |
+| `tools/cloud_run_scanner.py` | Calls Cloud Run Admin API to list all services and extract ingress, auth, and service account config. | No |
+| `tools/traffic_analyzer.py` | Queries Cloud Logging API for request counts within the configured lookback window. Classifies traffic as Active or Inactive. | No |
+| `tools/project_resolver.py` | Resolves a single project, folder, or org into a flat list of active project IDs using Resource Manager API. | No |
+| `tools/cost_estimator.py` | Calculates scope summary for the dry-run gate — project count, public services found, and estimated run time. | No |
+| `config/settings.py` | Loads all environment variables from `.env`. Single place to read config — all other files import from here. | No |
+| `main.py` | CLI entry point. Orchestrates the full pipeline in order: resolve → scan → traffic → classify → remediate → report. | No |
 
 ---
 
 ## Tech Stack
 
-| Component          | Technology                              |
-|--------------------|-----------------------------------------|
-| Language           | Python 3.11+                            |
-| LLM                | Gemini 2.5 Flash (Vertex AI)            |
-| Asset Discovery    | Google Cloud Run v2 Python SDK          |
-| Project Resolution | Google Cloud Resource Manager v3 SDK    |
-| Log Analysis       | Google Cloud Logging Python SDK         |
-| Concurrency        | Python `concurrent.futures` (stdlib)    |
-| Auth               | GCP Application Default Credentials     |
-| IDE                | Google Antigravity                      |
+| Component | Technology |
+|---|---|
+| Language | Python 3.11+ |
+| LLM | Gemini 2.5 Flash (Vertex AI) — single call per run |
+| Risk Classification | Pure Python against `config/risk_matrix.md` |
+| Remediation Commands | Jinja2 templates per risk category |
+| Asset Discovery | Google Cloud Run v2 Python SDK |
+| Traffic Analysis | Google Cloud Logging Python SDK |
+| Project Resolution | Google Cloud Resource Manager v3 SDK |
+| Concurrency | Python `concurrent.futures` (stdlib) |
+| Auth | GCP Application Default Credentials (ADC) |
+| IDE | Google Antigravity |
+
+---
+
+## Risk Matrix (6-Tier)
+
+| Category | Conditions | Risk Level |
+|---|---|---|
+| Critical: Exposed & Abandoned | ingress=all + unauthenticated + no traffic | Critical |
+| High: Public Direct Access | ingress=all + unauthenticated + has traffic | High |
+| Medium: Identity Leakage | ingress=all + authenticated + default SA | Medium |
+| Medium: LB Bypass Risk | ingress=all + authenticated | Medium |
+| Low: Shielded | ingress=internal-and-LB + authenticated | Low |
+| Minimal: Zero Trust | ingress=internal + custom SA + VPC SC | Minimal |
+
+Full logic and LLM instructions defined in `config/risk_matrix.md`.
+**To update risk standards — edit `risk_matrix.md` only. No code changes needed.**
 
 ---
 
@@ -64,22 +133,25 @@ CLI Input (--project | --folder | --org)
 
 ```
 gcp-security-agent/
-├── .env.example                  ← environment variable template
+├── .env.example
 ├── .gitignore
 ├── requirements.txt
 ├── README.md
-├── main.py                       ← CLI entry point
+├── main.py                        ← CLI entry point + pipeline orchestration
 ├── config/
-│   └── settings.py               ← env var loader
+│   ├── settings.py                ← env var loader (single source of config)
+│   └── risk_matrix.md             ← risk classification logic (single source of truth)
 ├── tools/
 │   ├── __init__.py
-│   ├── project_resolver.py       ← resolves project list (project/folder/org)
-│   ├── cloud_run_scanner.py      ← discovers public Cloud Run services
-│   ├── cost_estimator.py         ← dry-run scope + runtime estimation
-│   └── traffic_analyzer.py       ← Cloud Logging correlation (Safe/Risky)
+│   ├── project_resolver.py        ← resolves project list from project/folder/org
+│   ├── cloud_run_scanner.py       ← discovers public Cloud Run services
+│   ├── traffic_analyzer.py        ← Cloud Logging traffic correlation (Active/Inactive)
+│   ├── risk_classifier.py         ← deterministic 6-tier Python risk classification
+│   ├── cost_estimator.py          ← dry-run scope + run time estimation
+│   └── remediation_templates.py   ← Jinja2 gcloud fix commands per risk category
 ├── agent/
-│   └── orchestrator.py           ← Gemini report synthesis
-└── output/                       ← generated reports (gitignored)
+│   └── orchestrator.py            ← single Gemini 2.5 Flash report synthesis call
+└── output/                        ← generated reports (gitignored)
 ```
 
 ---
@@ -88,7 +160,7 @@ gcp-security-agent/
 
 ### Prerequisites
 - Python 3.11+
-- GCP project with Cloud Run and Cloud Logging enabled
+- GCP project with Cloud Run enabled
 - `gcloud` CLI installed and authenticated
 
 ### 1. Clone the repo
@@ -100,10 +172,8 @@ cd gcp-security-agent
 ### 2. Create and activate virtual environment
 ```bash
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+.venv\Scripts\activate      # Windows
+source .venv/bin/activate   # macOS/Linux
 ```
 
 ### 3. Install dependencies
@@ -114,7 +184,7 @@ pip install -r requirements.txt
 ### 4. Set up environment variables
 ```bash
 cp .env.example .env
-# Edit .env with your project values
+# Edit .env with your values
 ```
 
 ### 5. Authenticate with GCP
@@ -126,109 +196,69 @@ gcloud auth application-default login
 
 ## Usage
 
-### Single Project (personal / testing)
 ```bash
-python main.py --project my-gcp-project --prompt "Analyze Cloud Run exposure"
-```
+# Single project
+python main.py --project my-project --prompt "Analyze Cloud Run exposure"
 
-### All Projects in a Folder (team / squad level)
-```bash
+# All projects in a folder
 python main.py --folder 123456789 --prompt "Analyze Cloud Run exposure"
-```
 
-### Entire Organization (company-wide scan)
-```bash
+# Entire org
 python main.py --org 987654321 --prompt "Analyze Cloud Run exposure"
-```
 
-### Dry Run — Estimate Cost & Scope Before Executing
-```bash
+# Dry run — estimate scope first
 python main.py --org 987654321 --dry-run --prompt "Analyze Cloud Run exposure"
-```
 
-### Cap Number of Projects (safe testing at scale)
-```bash
+# Cap projects for safe testing
 python main.py --org 987654321 --max-projects 50 --prompt "Analyze Cloud Run exposure"
 ```
-
-### Combined Example
-```bash
-python main.py \
-  --org 987654321 \
-  --max-projects 100 \
-  --dry-run \
-  --prompt "Analyze Cloud Run exposure across all product teams"
-```
-
-Output report saved to `output/report_{timestamp}.md`.
-
----
-
-## Dry Run Output Example
-
-```
-Resolved 134 projects to scan
-
-╔══════════════════════════════════════╗
-║         DRY RUN SUMMARY              ║
-╠══════════════════════════════════════╣
-║ Projects to scan       : 134         ║
-║ Public services found  : 12          ║
-║ Traffic analysis days  : 30          ║
-║ Estimated run time     : ~1.3 mins   ║
-╚══════════════════════════════════════╝
-
-Proceed with full scan? (y/n):
-```
-
----
-
-## Auth & Permissions
-
-The agent uses **Application Default Credentials (ADC)** — no service account key files.
-
-Minimum IAM roles required:
-
-| Role | Purpose | Scope |
-|------|---------|-------|
-| `roles/run.viewer` | List Cloud Run services | Per project |
-| `roles/logging.viewer` | Read Cloud Logging request logs | Per project |
-| `roles/aiplatform.user` | Call Vertex AI (Gemini) | Per project |
-| `roles/resourcemanager.folderViewer` | List projects under a folder | Folder level |
-| `roles/resourcemanager.organizationViewer` | List all projects in the org | Org level |
 
 ---
 
 ## Performance & Cost Design
 
-| Mechanism | Detail |
-|---|---|
-| **Parallel scanning** | `ThreadPoolExecutor` with 10 workers — ~10x faster than sequential |
-| **Dry-Run gate** | `--dry-run` shows scope + runtime before traffic analysis starts |
-| **Project cap** | `--max-projects` limits scope during testing or staged rollouts |
-| **Log Filtering** | Phase 3 filters Logging by project/region/service + 30d window |
-| **Small-Scale Safety** | Sequential scanning used for single projects (prevents SDK hangs) |
-| **Single LLM call** | Gemini is called once per run regardless of project count |
+| Component | LLM Calls | Cost |
+|---|---|---|
+| Project resolution | 0 | Free |
+| Cloud Run scanning (parallel) | 0 | Free |
+| Traffic analysis (Cloud Logging) | 0 | Free |
+| Risk classification | 0 | Free — pure Python |
+| Remediation generation | 0 | Free — Jinja2 templates |
+| Report synthesis | **1 per run** | ~$0.01 flat |
+
+**Total LLM cost at any scale: ~$0.01 per run.**
+
+---
+
+## Auth & Permissions
+
+Uses **Application Default Credentials (ADC)** — no service account key files.
+
+| Role | Purpose | Scope |
+|---|---|---|
+| `roles/run.viewer` | List Cloud Run services | Per project |
+| `roles/logging.viewer` | Read Cloud Logging | Per project |
+| `roles/aiplatform.user` | Call Vertex AI (Gemini) | Per project |
+| `roles/resourcemanager.folderViewer` | List projects under folder | Folder level |
+| `roles/resourcemanager.organizationViewer` | List all org projects | Org level |
 
 ---
 
 ## Reusability
 
-The agent is environment-agnostic. Switch between environments via `.env` or CLI flags:
-
 ```bash
 # Personal project
-python main.py --project personal-project --prompt "Analyze Cloud Run exposure"
+python main.py --project jason-personal-project --prompt "Analyze Cloud Run exposure"
 
-# Company org scan (no code changes needed)
-python main.py --org COMPANY_ORG_ID --prompt "Analyze Cloud Run exposure across all product teams"
+# Company org (no code changes needed)
+python main.py --org HM_ORG_ID --prompt "Analyze Cloud Run exposure"
 ```
 
 ---
 
 ## Dry Run Policy
 
-**No changes are applied automatically.** The agent outputs `gcloud` commands for human review. Apply only after validating the report.
+**No changes are applied automatically.** All remediation output is `gcloud` commands for human review only.
 
 ---
 
@@ -236,6 +266,12 @@ python main.py --org COMPANY_ORG_ID --prompt "Analyze Cloud Run exposure across 
 
 - [x] Phase 1 — Scaffold + Auth
 - [x] Phase 2 — Cloud Run Scanner + Performance Guards
-- [x] Phase 3 — Traffic Correlation (Cloud Logging)
-- [x] Phase 4 — Gemini Report + Remediation Output
+- [x] Phase 3 — Traffic Correlation (Cloud Logging API)
+- [x] Phase 4 — Gemini 2.5 Flash Report + 6-Tier Risk Matrix + Remediation Templates
 - [ ] Phase 5 — IAM Basic Roles use case
+
+---
+
+## License
+
+MIT

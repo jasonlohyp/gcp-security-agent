@@ -34,7 +34,21 @@ def scan_cloud_run_services(project_id: str) -> list[dict]:
                 # Options: INGRESS_TRAFFIC_ALL, INGRESS_TRAFFIC_INTERNAL_ONLY, INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER
                 is_internal = "INTERNAL" in ingress_val
                 
-                # 2. Check IAM Policy for unauthenticated access
+                # 2. Extract Service Account and check if it's default
+                service_account = service.template.service_account or "default"
+                
+                # Default SA format: {PROJECT_NUMBER}-compute@developer.gserviceaccount.com
+                # We need the project number to be 100% sure.
+                # Fetching it once per project scan.
+                from google.cloud import resourcemanager_v3
+                rm_client = resourcemanager_v3.ProjectsClient()
+                project_info = rm_client.get_project(name=f"projects/{project_id}")
+                project_number = project_info.name.split('/')[-1]
+                default_sa = f"{project_number}-compute@developer.gserviceaccount.com"
+                
+                is_default_sa = (service_account == default_sa or service_account == "default")
+                
+                # 3. Check IAM Policy for unauthenticated access
                 request = iam_policy_pb2.GetIamPolicyRequest(resource=full_name)
                 policy = client.get_iam_policy(request=request)
                 
@@ -45,7 +59,7 @@ def scan_cloud_run_services(project_id: str) -> list[dict]:
                             unauthenticated = True
                             break
                 
-                # 3. Filter and categorize
+                # 4. Filter and categorize
                 if not is_internal:
                     reason_parts = []
                     if "ALL" in ingress_val:
@@ -62,6 +76,8 @@ def scan_cloud_run_services(project_id: str) -> list[dict]:
                         "region": region,
                         "ingress": ingress_val.replace("INGRESS_TRAFFIC_", "").lower().replace("_", "-"),
                         "unauthenticated": unauthenticated,
+                        "service_account": service_account if service_account != "default" else default_sa,
+                        "is_default_sa": is_default_sa,
                         "public_reason": " + ".join(reason_parts) if reason_parts else "exposed"
                     })
                     

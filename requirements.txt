@@ -6,8 +6,11 @@ google-cloud-run>=0.10.0
 google-cloud-logging>=3.9.0
 google-cloud-resource-manager>=1.12.0
 
-# Gemini SDK
+# Vertex AI / Gemini
 google-genai>=0.8.0
+
+# Templating (remediation commands)
+jinja2>=3.1.0
 
 # Utilities
 python-dotenv>=1.0.0
