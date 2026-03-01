@@ -218,10 +218,10 @@ The agent is environment-agnostic. Switch between environments via `.env` or CLI
 
 ```bash
 # Personal project
-python main.py --project jason-personal-project --prompt "Analyze Cloud Run exposure"
+python main.py --project personal-project --prompt "Analyze Cloud Run exposure"
 
 # Company org scan (no code changes needed)
-python main.py --org HM_ORG_ID --prompt "Analyze Cloud Run exposure across all product teams"
+python main.py --org COMPANY_ORG_ID --prompt "Analyze Cloud Run exposure across all product teams"
 ```
 
 ---

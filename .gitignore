@@ -210,3 +210,6 @@ __marimo__/
 *.json
 !package.json
 !package-lock.json
+
+# Output directory
+output/

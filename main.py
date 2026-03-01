@@ -6,6 +6,7 @@ from tools.cloud_run_scanner import scan_cloud_run_services
 from tools.project_resolver import resolve_projects
 from tools.cost_estimator import estimate_scan, print_dry_run_summary
 from tools.traffic_analyzer import analyze_traffic
+from agent.orchestrator import generate_report, save_report
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -175,7 +176,27 @@ def main():
         print(line)
     
     print(f"\nFound {len(all_findings)} public services across {len(projects)} projects.")
-    print("Phase 4 (Gemini Report Synthesis) would start now in a full run.")
+    
+    # Phase 4: Gemini Report Synthesis
+    print(f"\nGenerating security report with Gemini 2.5 Flash...")
+    # Determine project scope string for filename
+    if args.project:
+        project_scope = args.project
+    elif args.folder:
+        project_scope = f"folder_{args.folder}"
+    elif args.org:
+        project_scope = f"org_{args.org}"
+    else:
+        project_scope = "default"
+
+    report = generate_report(all_findings, project_scope, args.prompt)
+    report_path = save_report(report, project_scope)
+    
+    # Calculate risky vs safe for final summary
+    risky_count = len([f for f in all_findings if f['classification'] == 'Risky'])
+    
+    print(f"Report saved to: {report_path}")
+    print(f"\nScan complete | {len(projects)} projects scanned | {len(all_findings)} public services | {risky_count} risky | Report: {report_path}")
 
 if __name__ == "__main__":
     main()
