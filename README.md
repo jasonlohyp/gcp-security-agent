@@ -359,10 +359,11 @@ python main.py --org ORG_ID --prompt "Analyze Cloud Run exposure"
 - [x] Phase 2 — Cloud Run Scanner + Performance Guards
 - [x] Phase 3 — Traffic Correlation (Cloud Logging API)
 - [x] Phase 4 — Gemini 2.5 Flash Report + 6-Tier Risk Matrix + Remediation Templates
-- [ ] Phase 5 — Per-folder report generation (one report per team/folder)
-- [ ] Phase 6 — Schedule as Cloud Run Job (automated weekly scans)
-- [ ] Phase 7 — Email/Slack notification for Critical and High findings
-- [ ] Phase 8 — Multi-region parallel scanning optimisation
+- [ ] Phase 5 — Natural language prompt parsing (filter by risk level, drill down on a specific service, remediation-only mode)
+- [ ] Phase 6 — Per-folder report generation (one report per team/folder)
+- [ ] Phase 7 — Schedule as Cloud Run Job (automated weekly scans)
+- [ ] Phase 8 — Email/Slack notification for Critical and High findings
+- [ ] Phase 9 — Multi-region parallel scanning optimisation
 
 ---
 
