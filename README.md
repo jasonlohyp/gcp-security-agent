@@ -83,8 +83,8 @@ Keeping classification deterministic (Python) and synthesis separate (LLM) means
 
 | File | Role | Uses LLM? |
 |---|---|---|
-| `config/risk_matrix.md` | Single source of truth for risk classification logic. Read by both `risk_classifier.py` (as code reference) and `orchestrator.py` (injected into Gemini system prompt). Update this file to evolve security standards — no code changes needed. | No |
-| `tools/risk_classifier.py` | Pure Python 6-tier risk classifier. Reads each finding's ingress, auth, SA, and traffic data and assigns a risk category. Called in `main.py` for every finding before the LLM is invoked. | No |
+| `config/risk_matrix.md` | Single source of truth for risk classification logic. Read by `risk_classifier.py` (as code reference) and injected into Gemini system prompt by `orchestrator.py`. Update this file to evolve security standards — no code changes needed. | No |
+| `tools/risk_classifier.py` | Pure Python 6-tier risk classifier. Reads ingress, auth, SA, and traffic data and assigns a risk category. Called for every finding before the LLM is invoked. | No |
 | `tools/remediation_templates.py` | Jinja2 templates that generate ready-to-copy `gcloud` fix commands per risk category. Output stored in `finding["remediation"]` and passed to Gemini as pre-computed context — Gemini presents them, never rewrites them. | No |
 | `agent/orchestrator.py` | The only file that calls Gemini. Receives fully classified and remediated findings, loads `risk_matrix.md` as system context, and asks Gemini to write a narrative report. One API call per run. | ✅ Yes — once |
 | `tools/cloud_run_scanner.py` | Calls Cloud Run Admin API to list all services and extract ingress, auth, and service account config. | No |
@@ -160,12 +160,12 @@ gcp-security-agent/
 
 ### Prerequisites
 - Python 3.11+
-- GCP project with Cloud Run enabled
+- GCP project with Cloud Run and Vertex AI enabled
 - `gcloud` CLI installed and authenticated
 
 ### 1. Clone the repo
 ```bash
-git clone https://github.com/jasonlohyp/gcp-security-agent.git
+git clone https://github.com/YOUR_GITHUB_USERNAME/gcp-security-agent.git
 cd gcp-security-agent
 ```
 
@@ -192,6 +192,16 @@ cp .env.example .env
 gcloud auth application-default login
 ```
 
+### 6. Enable required GCP APIs
+```bash
+gcloud services enable \
+  run.googleapis.com \
+  logging.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  aiplatform.googleapis.com \
+  --project YOUR_PROJECT_ID
+```
+
 ---
 
 ## Usage
@@ -206,7 +216,7 @@ python main.py --folder 123456789 --prompt "Analyze Cloud Run exposure"
 # Entire org
 python main.py --org 987654321 --prompt "Analyze Cloud Run exposure"
 
-# Dry run — estimate scope first
+# Dry run — estimate scope first (recommended before large scans)
 python main.py --org 987654321 --dry-run --prompt "Analyze Cloud Run exposure"
 
 # Cap projects for safe testing
@@ -215,7 +225,85 @@ python main.py --org 987654321 --max-projects 50 --prompt "Analyze Cloud Run exp
 
 ---
 
-## Performance & Cost Design
+## Performance & Cost at Scale
+
+### Cost Projection
+
+| Component | Operations | Cost |
+|---|---|---|
+| Resource Manager API | 1 call to resolve projects | Free |
+| Cloud Run Admin API | 1 call per project | Free |
+| Cloud Logging API | 1 query per public service found | Free |
+| Risk classification | Pure Python per service | Free |
+| Remediation templates | Jinja2 render per service | Free |
+| **Gemini 2.5 Flash** | **1 call per run — flat** | **~$0.01–$0.05** |
+
+**Total cost: under $0.05 per full org scan regardless of project count.**
+
+The Gemini cost is proportional to the number of public services found (token count), not the number of projects scanned. Scanning 1500 projects with 5 public services costs the same as scanning 10 projects with 5 public services.
+
+---
+
+### Performance Projection
+
+| Projects | Workers | Estimated Scan Time |
+|---|---|---|
+| 10 | 10 | ~5 seconds |
+| 100 | 10 | ~30 seconds |
+| 500 | 10 | ~2.5 minutes |
+| 1500 | 10 | ~7–8 minutes |
+| 1500 | 20 | ~4 minutes |
+
+The bottleneck is the Cloud Run scanning phase. Traffic analysis, classification, and report generation add less than 30 seconds regardless of scale.
+
+---
+
+### API Quota Considerations
+
+The Cloud Run Admin API has a default quota of **600 requests/minute**. At `MAX_WORKERS=10` scanning ~1500 projects, you may approach this limit.
+
+**Recommended approach for large orgs:**
+
+**Option 1 — Scan by folder (safest)**
+```bash
+# Scan one team/folder at a time — stays well under quota
+python main.py --folder TEAM_A_FOLDER_ID --prompt "Analyze Cloud Run exposure"
+python main.py --folder TEAM_B_FOLDER_ID --prompt "Analyze Cloud Run exposure"
+```
+This also produces per-team reports which are easier for team leads to action.
+
+**Option 2 — Reduce workers**
+```bash
+# In .env — reduce to 5 workers to stay under quota
+MAX_WORKERS=5
+```
+
+**Option 3 — Increase workers for trusted large orgs**
+```bash
+# In .env — increase to 20 workers if quota allows
+# First check your quota: GCP Console → IAM → Quotas → Cloud Run API
+MAX_WORKERS=20
+```
+
+**To check and increase your Cloud Run API quota:**
+```
+GCP Console → APIs & Services → Cloud Run Admin API → Quotas
+```
+
+---
+
+### Known Behaviours at Scale
+
+| Scenario | Behaviour |
+|---|---|
+| Project has Cloud Run API disabled | Scanner logs a warning and skips — does not fail the run |
+| Project has no Cloud Run services | Returns empty findings — counted in progress, excluded from report |
+| Logging API unavailable for a service | Traffic classified as `Unknown` — still included in report with a warning |
+| Gemini token limit exceeded (50+ findings) | Split scan by folder to reduce findings per report |
+
+---
+
+## Performance & Cost Design Summary
 
 | Component | LLM Calls | Cost |
 |---|---|---|
@@ -224,9 +312,7 @@ python main.py --org 987654321 --max-projects 50 --prompt "Analyze Cloud Run exp
 | Traffic analysis (Cloud Logging) | 0 | Free |
 | Risk classification | 0 | Free — pure Python |
 | Remediation generation | 0 | Free — Jinja2 templates |
-| Report synthesis | **1 per run** | ~$0.01 flat |
-
-**Total LLM cost at any scale: ~$0.01 per run.**
+| Report synthesis | **1 per run** | ~$0.01–$0.05 flat |
 
 ---
 
@@ -246,19 +332,24 @@ Uses **Application Default Credentials (ADC)** — no service account key files.
 
 ## Reusability
 
-```bash
-# Personal project
-python main.py --project jason-personal-project --prompt "Analyze Cloud Run exposure"
+The agent is environment-agnostic. Switch targets using CLI flags — no code changes needed:
 
-# Company org (no code changes needed)
-python main.py --org HM_ORG_ID --prompt "Analyze Cloud Run exposure"
+```bash
+# Single project
+python main.py --project my-dev-project --prompt "Analyze Cloud Run exposure"
+
+# Team folder
+python main.py --folder FOLDER_ID --prompt "Analyze Cloud Run exposure"
+
+# Full org scan
+python main.py --org ORG_ID --prompt "Analyze Cloud Run exposure"
 ```
 
 ---
 
 ## Dry Run Policy
 
-**No changes are applied automatically.** All remediation output is `gcloud` commands for human review only.
+**No changes are applied automatically.** All remediation output is `gcloud` commands for human review only. Always use `--dry-run` first when scanning a large scope to verify project count and estimated run time before proceeding.
 
 ---
 
@@ -268,7 +359,10 @@ python main.py --org HM_ORG_ID --prompt "Analyze Cloud Run exposure"
 - [x] Phase 2 — Cloud Run Scanner + Performance Guards
 - [x] Phase 3 — Traffic Correlation (Cloud Logging API)
 - [x] Phase 4 — Gemini 2.5 Flash Report + 6-Tier Risk Matrix + Remediation Templates
-- [ ] Phase 5 — IAM Basic Roles use case
+- [ ] Phase 5 — Per-folder report generation (one report per team/folder)
+- [ ] Phase 6 — Schedule as Cloud Run Job (automated weekly scans)
+- [ ] Phase 7 — Email/Slack notification for Critical and High findings
+- [ ] Phase 8 — Multi-region parallel scanning optimisation
 
 ---
 
