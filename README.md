@@ -35,7 +35,7 @@ CLI Input (--project | --folder | --org)
   cost_estimator.py + [--dry-run gate]
           │
           ▼
-  traffic_analyzer.py           ← Cloud Logging API
+  traffic_analyzer.py           ← Cloud Logging API (parallel)
           │
           ▼
   risk_classifier.py            ← deterministic Python — zero LLM cost
@@ -48,6 +48,7 @@ CLI Input (--project | --folder | --org)
   orchestrator.py               ← ONE Gemini 2.5 Flash call
           │      ▲
           │      └── reads config/risk_matrix.md as system prompt context
+          │      └── uses --vertex-project or PROJECT_ID in .env for auth
           ▼
   output/report_{scope}_{ts}.md
 ```
@@ -86,13 +87,13 @@ Keeping classification deterministic (Python) and synthesis separate (LLM) means
 | `config/risk_matrix.md` | Single source of truth for risk classification logic. Read by `risk_classifier.py` (as code reference) and injected into Gemini system prompt by `orchestrator.py`. Update this file to evolve security standards — no code changes needed. | No |
 | `tools/risk_classifier.py` | Pure Python 6-tier risk classifier. Reads ingress, auth, SA, and traffic data and assigns a risk category. Called for every finding before the LLM is invoked. | No |
 | `tools/remediation_templates.py` | Jinja2 templates that generate ready-to-copy `gcloud` fix commands per risk category. Output stored in `finding["remediation"]` and passed to Gemini as pre-computed context — Gemini presents them, never rewrites them. | No |
-| `agent/orchestrator.py` | The only file that calls Gemini. Receives fully classified and remediated findings, loads `risk_matrix.md` as system context, and asks Gemini to write a narrative report. One API call per run. | ✅ Yes — once |
-| `tools/cloud_run_scanner.py` | Calls Cloud Run Admin API to list all services and extract ingress, auth, and service account config. | No |
-| `tools/traffic_analyzer.py` | Queries Cloud Logging API for request counts within the configured lookback window. Classifies traffic as Active or Inactive. | No |
-| `tools/project_resolver.py` | Resolves a single project, folder, or org into a flat list of active project IDs using Resource Manager API. | No |
+| `agent/orchestrator.py` | The only file that calls Gemini. Receives fully classified and remediated findings, loads `risk_matrix.md` as system context, and asks Gemini to write a narrative report. One API call per run. Authenticated using `--vertex-project` or `PROJECT_ID` in `.env`. | ✅ Yes — once |
+| `tools/cloud_run_scanner.py` | Calls Cloud Run Admin API to list all services and extract ingress, auth, and service account config. Accepts `project_number` from `project_resolver.py` — no extra API call needed. | No |
+| `tools/traffic_analyzer.py` | Queries Cloud Logging API for request counts within the configured lookback window. Runs in parallel. Classifies traffic as Active or Inactive. | No |
+| `tools/project_resolver.py` | Resolves a single project, folder, or org into a flat list of active projects. Returns both `project_id` and `project_number` in a single API call — eliminates redundant `get_project` calls downstream. | No |
 | `tools/cost_estimator.py` | Calculates scope summary for the dry-run gate — project count, public services found, and estimated run time. | No |
 | `config/settings.py` | Loads all environment variables from `.env`. Single place to read config — all other files import from here. | No |
-| `main.py` | CLI entry point. Orchestrates the full pipeline in order: resolve → scan → traffic → classify → remediate → report. | No |
+| `main.py` | CLI entry point. Orchestrates the full pipeline in order: resolve → scan → traffic → classify → remediate → report. Separates scan scope (`--project/--folder/--org`) from Vertex AI auth (`--vertex-project` or `PROJECT_ID` in `.env`). | No |
 
 ---
 
@@ -119,10 +120,13 @@ Keeping classification deterministic (Python) and synthesis separate (LLM) means
 |---|---|---|
 | Critical: Exposed & Abandoned | ingress=all + unauthenticated + no traffic | Critical |
 | High: Public Direct Access | ingress=all + unauthenticated + has traffic | High |
+| High: LB Exposed & Abandoned | ingress=LB + unauthenticated + no traffic | High |
+| Medium: LB Unauthenticated | ingress=LB + unauthenticated + has traffic | Medium |
 | Medium: Identity Leakage | ingress=all + authenticated + default SA | Medium |
+| Medium: Identity Leakage (LB) | ingress=LB + authenticated + default SA | Medium |
 | Medium: LB Bypass Risk | ingress=all + authenticated | Medium |
-| Low: Shielded | ingress=internal-and-LB + authenticated | Low |
-| Minimal: Zero Trust | ingress=internal + custom SA + VPC SC | Minimal |
+| Low: Shielded | ingress=LB + authenticated + custom SA | Low |
+| Minimal: Zero Trust | ingress=internal | Minimal |
 
 Full logic and LLM instructions defined in `config/risk_matrix.md`.
 **To update risk standards — edit `risk_matrix.md` only. No code changes needed.**
@@ -143,9 +147,9 @@ gcp-security-agent/
 │   └── risk_matrix.md             ← risk classification logic (single source of truth)
 ├── tools/
 │   ├── __init__.py
-│   ├── project_resolver.py        ← resolves project list from project/folder/org
+│   ├── project_resolver.py        ← resolves project list + project numbers
 │   ├── cloud_run_scanner.py       ← discovers public Cloud Run services
-│   ├── traffic_analyzer.py        ← Cloud Logging traffic correlation (Active/Inactive)
+│   ├── traffic_analyzer.py        ← Cloud Logging traffic correlation (parallel)
 │   ├── risk_classifier.py         ← deterministic 6-tier Python risk classification
 │   ├── cost_estimator.py          ← dry-run scope + run time estimation
 │   └── remediation_templates.py   ← Jinja2 gcloud fix commands per risk category
@@ -187,6 +191,14 @@ cp .env.example .env
 # Edit .env with your values
 ```
 
+**Key `.env` variable:**
+```dotenv
+# PROJECT_ID is used exclusively for Vertex AI / Gemini authentication.
+# It is NOT the scan target — use --project / --folder / --org for that.
+# Your account must have roles/aiplatform.user on this project.
+PROJECT_ID=your-vertex-ai-project
+```
+
 ### 5. Authenticate with GCP
 ```bash
 gcloud auth application-default login
@@ -208,20 +220,66 @@ gcloud services enable \
 
 ```bash
 # Single project
-python main.py --project my-project --prompt "Analyze Cloud Run exposure"
+python main.py --project my-project
 
 # All projects in a folder
-python main.py --folder 123456789 --prompt "Analyze Cloud Run exposure"
+python main.py --folder 123456789
 
 # Entire org
-python main.py --org 987654321 --prompt "Analyze Cloud Run exposure"
+python main.py --org 987654321
+
+# With custom prompt
+python main.py --project my-project --prompt "Analyze Cloud Run exposure"
 
 # Dry run — estimate scope first (recommended before large scans)
-python main.py --org 987654321 --dry-run --prompt "Analyze Cloud Run exposure"
+python main.py --org 987654321 --dry-run
 
 # Cap projects for safe testing
-python main.py --org 987654321 --max-projects 50 --prompt "Analyze Cloud Run exposure"
+python main.py --org 987654321 --max-projects 10
+
+# Scan a company project using a different project for Gemini auth
+python main.py --project company-project --vertex-project my-personal-project
 ```
+
+---
+
+## Project ID Separation — Scan Target vs Vertex AI Auth
+
+This is the most important configuration concept in the agent.
+
+Two project IDs serve different purposes and are intentionally independent:
+
+| Setting | Purpose | Where to set |
+|---|---|---|
+| `--project` / `--folder` / `--org` | **Scan target** — what gets scanned for Cloud Run exposure | CLI flag |
+| `PROJECT_ID` in `.env` | **Vertex AI auth** — which project pays for and authenticates Gemini | `.env` file |
+| `--vertex-project` | **Vertex AI auth override** — overrides `PROJECT_ID` in `.env` for a single run | CLI flag |
+
+### Why they are separate
+
+You often want to **scan a project you don't own** (e.g. a company project) while **authenticating Gemini via a project you do own** (e.g. your personal project with `roles/aiplatform.user`).
+
+```bash
+# Scan company project, authenticate Gemini via personal project
+python main.py \
+  --project company-project-id \
+  --vertex-project my-personal-project
+
+# Or set PROJECT_ID=my-personal-project in .env and just pass --project
+python main.py --project company-project-id
+```
+
+### Required IAM roles
+
+| Role | Project | Purpose |
+|---|---|---|
+| `roles/run.viewer` | Scan target project(s) | List Cloud Run services |
+| `roles/logging.viewer` | Scan target project(s) | Read Cloud Logging |
+| `roles/resourcemanager.folderViewer` | Folder (if using --folder) | List projects under folder |
+| `roles/resourcemanager.organizationViewer` | Org (if using --org) | List all org projects |
+| `roles/aiplatform.user` | **Vertex AI project only** (`PROJECT_ID` or `--vertex-project`) | Call Gemini via Vertex AI |
+
+> **Note:** `roles/aiplatform.user` is only needed on your Vertex AI project — not on every project being scanned.
 
 ---
 
@@ -231,18 +289,24 @@ python main.py --org 987654321 --max-projects 50 --prompt "Analyze Cloud Run exp
 
 | Component | Operations | Cost |
 |---|---|---|
-| Resource Manager API | 1 call to resolve projects | Free |
-| Cloud Run Admin API | 1 call per project | Free |
-| Cloud Logging API | 1 query per public service found | Free |
+| Resource Manager API | 1 call to resolve all projects + numbers | Free |
+| Cloud Run Admin API | 1 call per project (parallel) | Free |
+| Cloud Logging API | 1 query per public service found (parallel) | Free |
 | Risk classification | Pure Python per service | Free |
 | Remediation templates | Jinja2 render per service | Free |
 | **Gemini 2.5 Flash** | **1 call per run — flat** | **~$0.01–$0.05** |
 
 **Total cost: under $0.05 per full org scan regardless of project count.**
 
-The Gemini cost is proportional to the number of public services found (token count), not the number of projects scanned. Scanning 1500 projects with 5 public services costs the same as scanning 10 projects with 5 public services.
+### API Calls Per Run
 
----
+| Scope | Fixed calls | Variable calls | Total |
+|---|---|---|---|
+| 1 project | 3 | +2 per public service | ~3–5 |
+| 10 projects (folder) | 12 | +2 per public service | ~12–30 |
+| 100 projects | 102 | +2 per public service | ~102+ |
+
+Project number is now fetched alongside project ID in a single `search_projects` call — halving API usage compared to fetching project numbers separately.
 
 ### Performance Projection
 
@@ -254,7 +318,7 @@ The Gemini cost is proportional to the number of public services found (token co
 | 1500 | 10 | ~7–8 minutes |
 | 1500 | 20 | ~4 minutes |
 
-The bottleneck is the Cloud Run scanning phase. Traffic analysis, classification, and report generation add less than 30 seconds regardless of scale.
+Both Cloud Run scanning and traffic analysis run in parallel. The bottleneck is the Cloud Run scanning phase.
 
 ---
 
@@ -266,28 +330,22 @@ The Cloud Run Admin API has a default quota of **600 requests/minute**. At `MAX_
 
 **Option 1 — Scan by folder (safest)**
 ```bash
-# Scan one team/folder at a time — stays well under quota
-python main.py --folder TEAM_A_FOLDER_ID --prompt "Analyze Cloud Run exposure"
-python main.py --folder TEAM_B_FOLDER_ID --prompt "Analyze Cloud Run exposure"
+python main.py --folder TEAM_A_FOLDER_ID
+python main.py --folder TEAM_B_FOLDER_ID
 ```
 This also produces per-team reports which are easier for team leads to action.
 
 **Option 2 — Reduce workers**
 ```bash
-# In .env — reduce to 5 workers to stay under quota
+# In .env
 MAX_WORKERS=5
 ```
 
 **Option 3 — Increase workers for trusted large orgs**
 ```bash
 # In .env — increase to 20 workers if quota allows
-# First check your quota: GCP Console → IAM → Quotas → Cloud Run API
+# First check: GCP Console → APIs & Services → Cloud Run Admin API → Quotas
 MAX_WORKERS=20
-```
-
-**To check and increase your Cloud Run API quota:**
-```
-GCP Console → APIs & Services → Cloud Run Admin API → Quotas
 ```
 
 ---
@@ -300,50 +358,7 @@ GCP Console → APIs & Services → Cloud Run Admin API → Quotas
 | Project has no Cloud Run services | Returns empty findings — counted in progress, excluded from report |
 | Logging API unavailable for a service | Traffic classified as `Unknown` — still included in report with a warning |
 | Gemini token limit exceeded (50+ findings) | Split scan by folder to reduce findings per report |
-
----
-
-## Performance & Cost Design Summary
-
-| Component | LLM Calls | Cost |
-|---|---|---|
-| Project resolution | 0 | Free |
-| Cloud Run scanning (parallel) | 0 | Free |
-| Traffic analysis (Cloud Logging) | 0 | Free |
-| Risk classification | 0 | Free — pure Python |
-| Remediation generation | 0 | Free — Jinja2 templates |
-| Report synthesis | **1 per run** | ~$0.01–$0.05 flat |
-
----
-
-## Auth & Permissions
-
-Uses **Application Default Credentials (ADC)** — no service account key files.
-
-| Role | Purpose | Scope |
-|---|---|---|
-| `roles/run.viewer` | List Cloud Run services | Per project |
-| `roles/logging.viewer` | Read Cloud Logging | Per project |
-| `roles/aiplatform.user` | Call Vertex AI (Gemini) | Per project |
-| `roles/resourcemanager.folderViewer` | List projects under folder | Folder level |
-| `roles/resourcemanager.organizationViewer` | List all org projects | Org level |
-
----
-
-## Reusability
-
-The agent is environment-agnostic. Switch targets using CLI flags — no code changes needed:
-
-```bash
-# Single project
-python main.py --project my-dev-project --prompt "Analyze Cloud Run exposure"
-
-# Team folder
-python main.py --folder FOLDER_ID --prompt "Analyze Cloud Run exposure"
-
-# Full org scan
-python main.py --org ORG_ID --prompt "Analyze Cloud Run exposure"
-```
+| `roles/aiplatform.user` missing on Vertex AI project | Clean error with exact fix instructions — no raw traceback |
 
 ---
 

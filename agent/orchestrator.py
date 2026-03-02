@@ -28,9 +28,7 @@ def _build_findings_context(classified_findings: list[dict]) -> str:
     """
     lines = []
     for f in classified_findings:
-        # Pull lookback_days from finding — set by traffic_analyzer dynamically
         lookback_days = f.get("lookback_days", settings.TRAFFIC_LOOKBACK_DAYS)
-
         lines.append(f"""
 Service:              {f.get('name')}
   Project:            {f.get('project_id')}
@@ -87,13 +85,18 @@ def generate_report(
         project_scope:       Human readable scope e.g. "project:my-project"
         user_prompt:         Original user prompt
         project_id:          GCP project ID for Vertex AI initialisation
+                             Should be a project where you have roles/aiplatform.user
+                             This is NOT required to be the same as the scan target.
 
     Returns:
         Markdown report as string
+
+    Raises:
+        PermissionError: if roles/aiplatform.user is missing on the Vertex AI project
+        RuntimeError:    if Gemini model is not found or other API error occurs
     """
     risk_matrix = _load_risk_matrix()
 
-    # Use actual lookback_days from first finding, fallback to settings
     lookback_days = settings.TRAFFIC_LOOKBACK_DAYS
     if classified_findings:
         lookback_days = classified_findings[0].get("lookback_days", lookback_days)
@@ -117,7 +120,7 @@ IMPORTANT RULES:
 - Do NOT re-classify services — use the risk_category and risk_level already provided
 - Do NOT generate new gcloud commands — use the remediation commands already provided
 - Do NOT omit any services from the report
-- Always reference the actual traffic window ({lookback_days} days)
+- Always reference the actual traffic window ({lookback_days} days) — never assume 30 days
 - Keep the executive summary concise (3-5 sentences)
 - Use markdown tables for the findings summary
 - Flag Critical and High findings prominently
@@ -153,11 +156,44 @@ Produce the report in this exact structure:
     )
 
     logger.info(f"Calling Gemini {settings.GEMINI_MODEL} for report generation...")
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=user_message,
-        config={"system_instruction": system_prompt},
-    )
+
+    try:
+        response = client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=user_message,
+            config={"system_instruction": system_prompt},
+        )
+    except Exception as e:
+        error_str = str(e)
+
+        if "403" in error_str or "PERMISSION_DENIED" in error_str:
+            raise PermissionError(
+                f"\n\n❌ PERMISSION DENIED — Gemini report generation failed.\n"
+                f"   Vertex AI project used: {project_id}\n"
+                f"   Missing role: roles/aiplatform.user\n\n"
+                f"   Fix option 1 — Grant the role on your Vertex AI project:\n"
+                f"   gcloud projects add-iam-policy-binding {project_id} \\\n"
+                f"     --member='user:YOUR_EMAIL' \\\n"
+                f"     --role='roles/aiplatform.user'\n\n"
+                f"   Fix option 2 — Point to a project where you already have access:\n"
+                f"   Set PROJECT_ID=your-personal-project in .env\n"
+                f"   Note: PROJECT_ID is used for Gemini auth only, not the scan target.\n"
+                f"   Use --project or --folder or --org to set the scan scope separately.\n"
+            ) from e
+
+        elif "404" in error_str or "not exist" in error_str:
+            raise RuntimeError(
+                f"\n\n❌ MODEL NOT FOUND — {settings.GEMINI_MODEL} not available "
+                f"in region {settings.VERTEX_AI_LOCATION}.\n"
+                f"   Check GEMINI_MODEL and VERTEX_AI_LOCATION values in your .env\n"
+                f"   Current values: model={settings.GEMINI_MODEL} | "
+                f"location={settings.VERTEX_AI_LOCATION}\n"
+            ) from e
+
+        else:
+            raise RuntimeError(
+                f"\n\n❌ Gemini API error — {error_str}\n"
+            ) from e
 
     return response.text
 
@@ -173,6 +209,8 @@ def save_report(report: str, project_scope: str) -> str:
     Returns:
         Path to the saved report file
     """
+    from pathlib import Path
+
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
 

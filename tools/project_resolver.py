@@ -1,42 +1,53 @@
+# file: tools/project_resolver.py
+# Resolves GCP project IDs and numbers from a project, folder, or org scope.
+# Returns both project_id and project_number in a single API call per project
+# so downstream tools (cloud_run_scanner.py) never need to call get_project again.
+
 from google.cloud import resourcemanager_v3
 
-def resolve_projects(project_id: str = None, folder_id: str = None, org_id: str = None) -> list[str]:
+
+def resolve_projects(
+    project_id: str = None,
+    folder_id: str = None,
+    org_id: str = None,
+) -> list[dict]:
     """
-    Resolves a list of active GCP project IDs based on the provided scope.
-    
+    Resolves active GCP projects based on the provided scope.
+
     Args:
-        project_id: A single project ID.
-        folder_id: A folder ID (discover all projects under it).
-        org_id: An organization ID (discover all projects under it).
-        
+        project_id: A single project ID
+        folder_id:  A folder ID — resolves all active projects under it
+        org_id:     An org ID — resolves all active projects in the org
+
     Returns:
-        A list of active project IDs.
+        List of dicts with:
+        - project_id:     e.g. "my-project-id"
+        - project_number: e.g. "123456789012"
     """
-    if project_id:
-        return [project_id]
-    
     client = resourcemanager_v3.ProjectsClient()
-    
-    # query uses 'parent' field which handles both folders and organizations
-    # format: 'folders/123' or 'organizations/456'
+
+    if project_id:
+        # Single project — fetch once to get project number
+        project_info = client.get_project(name=f"projects/{project_id}")
+        project_number = project_info.name.split("/")[-1]
+        return [{"project_id": project_id, "project_number": project_number}]
+
     if folder_id:
         parent = f"folders/{folder_id}"
     elif org_id:
         parent = f"organizations/{org_id}"
     else:
-        # If nothing is provided, return an empty list or raise an error? 
-        # main.py handles validation, so we return empty.
         return []
 
-    # search_projects handles recursive discovery across children
-    # query for active projects only
     query = f"parent:{parent} state:ACTIVE"
     request = resourcemanager_v3.SearchProjectsRequest(query=query)
-    
-    project_ids = []
-    projects = client.search_projects(request=request)
-    
-    for project in projects:
-        project_ids.append(project.project_id)
-        
-    return project_ids
+
+    projects = []
+    for project in client.search_projects(request=request):
+        project_number = project.name.split("/")[-1]
+        projects.append({
+            "project_id": project.project_id,
+            "project_number": project_number,
+        })
+
+    return projects

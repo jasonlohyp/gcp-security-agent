@@ -2,6 +2,20 @@
 # Deterministic risk classifier for Cloud Run services.
 # No LLM calls — pure Python logic based on config/risk_matrix.md
 # This keeps classification consistent, fast, and free at org scale.
+#
+# Full classification matrix (first match wins):
+#
+# ingress=all      + unauthenticated + no traffic  → Critical: Exposed & Abandoned
+# ingress=all      + unauthenticated + has traffic → High: Public Direct Access
+# ingress=all      + authenticated   + default SA  → Medium: Identity Leakage
+# ingress=all      + authenticated                 → Medium: LB Bypass Risk
+# ingress=LB       + unauthenticated + no traffic  → High: LB Exposed & Abandoned
+# ingress=LB       + unauthenticated + has traffic → Medium: LB Unauthenticated
+# ingress=LB       + authenticated   + default SA  → Medium: Identity Leakage (LB)
+# ingress=LB       + authenticated                 → Low: Shielded
+# ingress=internal + unauthenticated + no traffic  → Low: Internal Exposed (Abandoned)
+# ingress=internal + unauthenticated + has traffic → Low: Internal Unauthenticated
+# ingress=internal + authenticated                 → Minimal: Zero Trust
 
 import logging
 
@@ -10,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def classify_service(finding: dict) -> dict:
     """
-    Classifies a Cloud Run service against the 6-tier risk matrix.
+    Classifies a Cloud Run service against the risk matrix.
     Evaluates three dimensions in order: Network → Auth → Identity.
 
     Args:
@@ -18,10 +32,10 @@ def classify_service(finding: dict) -> dict:
 
     Returns:
         finding dict enriched with:
-        - risk_category: str
-        - risk_level: str (Critical | High | Medium | Low | Minimal)
+        - risk_category:        str
+        - risk_level:           str (Critical | High | Medium | Low | Minimal)
         - triggered_dimensions: list[str]
-        - needs_remediation: bool
+        - needs_remediation:    bool
     """
     ingress = finding.get("ingress", "").lower()
     unauthenticated = finding.get("unauthenticated", False)
@@ -51,6 +65,8 @@ def classify_service(finding: dict) -> dict:
         triggered.append("Identity: Custom service account in use")
 
     # --- Classification Logic (first match wins) ---
+
+    # === ingress=all cases ===
     if ingress == "all" and unauthenticated and request_count == 0:
         category = "Critical: Exposed & Abandoned"
         risk_level = "Critical"
@@ -71,22 +87,61 @@ def classify_service(finding: dict) -> dict:
         risk_level = "Medium"
         needs_remediation = True
 
+    # === ingress=internal-and-cloud-load-balancing cases ===
+    elif ingress == "internal-and-cloud-load-balancing" and unauthenticated and request_count == 0:
+        # Behind LB but unauthenticated and abandoned — likely misconfigured
+        category = "High: LB Exposed & Abandoned"
+        risk_level = "High"
+        needs_remediation = True
+
+    elif ingress == "internal-and-cloud-load-balancing" and unauthenticated and request_count > 0:
+        # Behind LB but no auth — any VPC workload can call it without identity
+        category = "Medium: LB Unauthenticated"
+        risk_level = "Medium"
+        needs_remediation = True
+
+    elif ingress == "internal-and-cloud-load-balancing" and not unauthenticated and is_default_sa:
+        # Properly behind LB + auth but default SA is a lateral movement risk
+        category = "Medium: Identity Leakage (LB)"
+        risk_level = "Medium"
+        needs_remediation = True
+
     elif ingress == "internal-and-cloud-load-balancing" and not unauthenticated:
+        # Enterprise standard — LB + auth + custom SA
         category = "Low: Shielded"
         risk_level = "Low"
         needs_remediation = False
 
-    elif ingress == "internal":
+    # === ingress=internal cases ===
+    elif ingress == "internal" and unauthenticated and request_count == 0:
+        # VPC-scoped but unauthenticated and abandoned — likely forgotten
+        # Network boundary provides protection but no identity control inside VPC
+        category = "Low: Internal Exposed (Abandoned)"
+        risk_level = "Low"
+        needs_remediation = True
+
+    elif ingress == "internal" and unauthenticated and request_count > 0:
+        # VPC-scoped but unauthenticated and actively used
+        # Any compromised workload inside VPC can call this with no identity check
+        category = "Low: Internal Unauthenticated"
+        risk_level = "Low"
+        needs_remediation = True
+
+    elif ingress == "internal" and not unauthenticated:
+        # Gold standard — VPC-only + IAM required
         category = "Minimal: Zero Trust"
         risk_level = "Minimal"
         needs_remediation = False
 
     else:
-        # Fallback — treat unknown as medium risk
+        # True fallback — ingress value not recognised at all
         category = "Medium: Unknown Configuration"
         risk_level = "Medium"
         needs_remediation = True
-        logger.warning(f"Unrecognised ingress config for {finding.get('name')}: {ingress}")
+        logger.warning(
+            f"Unrecognised ingress config for {finding.get('name')}: {ingress} — "
+            f"defaulting to Medium risk. Check cloud_run_scanner.py ingress_map."
+        )
 
     return {
         **finding,

@@ -3,6 +3,7 @@
 # Classifies each service as "Active" or "Inactive" based on request count
 # within the configured lookback window.
 # All time windows driven by settings.TRAFFIC_LOOKBACK_DAYS — never hardcoded.
+# max_results capped at 100 — enough to classify activity, avoids slow 1000-entry fetches.
 
 import logging
 from datetime import datetime, timezone, timedelta
@@ -28,17 +29,16 @@ def analyze_traffic(
         region:        Cloud Run service region
         lookback_days: Number of days to look back.
                        Defaults to settings.TRAFFIC_LOOKBACK_DAYS from .env.
-                       Override by passing a value explicitly.
 
     Returns:
         dict with:
-        - service_name:       Cloud Run service name
-        - project_id:         GCP project ID
-        - region:             Cloud Run region
-        - request_count:      total requests in the lookback window
-        - last_request_date:  ISO date string of most recent request, or None
-        - lookback_days:      actual window used (passed through for reporting)
-        - classification:     "Active" if request_count > 0, else "Inactive"
+        - service_name:      Cloud Run service name
+        - project_id:        GCP project ID
+        - region:            Cloud Run region
+        - request_count:     requests found within max_results cap (100)
+        - last_request_date: ISO date string of most recent request, or None
+        - lookback_days:     actual window used (passed through for reporting)
+        - classification:    "Active" if request_count > 0, else "Inactive"
     """
     result = {
         "service_name": service_name,
@@ -53,7 +53,6 @@ def analyze_traffic(
     try:
         client = logging_v2.Client(project=project_id)
 
-        # Dynamic time window — driven by lookback_days, never hardcoded
         since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -65,10 +64,12 @@ def analyze_traffic(
             f'AND timestamp>="{since_str}"'
         )
 
+        # Cap at 100 entries — sufficient to classify Active vs Inactive
+        # and get a representative request count without slow 1000-entry fetches
         entries = list(client.list_entries(
             filter_=log_filter,
             order_by=logging_v2.DESCENDING,
-            max_results=1000,
+            max_results=100,
         ))
 
         request_count = len(entries)
@@ -79,7 +80,6 @@ def analyze_traffic(
             latest_ts = entries[0].timestamp
             result["last_request_date"] = latest_ts.strftime("%Y-%m-%d")
 
-        # Classification driven by request_count — no hardcoded label strings
         result["classification"] = "Active" if request_count > 0 else "Inactive"
 
     except Exception as e:
