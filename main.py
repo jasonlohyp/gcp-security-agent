@@ -19,7 +19,6 @@ from config import settings
 from tools.project_resolver import resolve_projects
 from tools.cloud_run_scanner import scan_cloud_run_services
 from tools.cloud_functions_scanner import scan_cloud_functions
-from tools.traffic_analyzer import analyze_traffic
 from tools.risk_classifier import classify_service, summarise_findings
 from tools.remediation_templates import get_remediation
 from tools.cost_estimator import estimate_scan, print_dry_run_summary
@@ -120,15 +119,25 @@ def _short_type(resource_type: str) -> str:
     }.get(resource_type, resource_type)
 
 
-def fetch_traffic(finding: dict) -> tuple:
-    """Worker function for parallel traffic analysis."""
-    traffic = analyze_traffic(
-        project_id=finding["project_id"],
-        service_name=finding["name"],
-        region=finding["region"],
+def fetch_traffic_for_project(pid: str, project_findings: list) -> list:
+    """
+    Worker function — fetches traffic for ALL findings in a project
+    in a SINGLE Cloud Logging API call (batch query).
+
+    Why: Cloud Logging quota is 60 read requests/min PER PROJECT being read.
+    Firing 1 call per service (old approach) easily exceeds this on projects
+    with many public services. Batch = 1 call per project = quota safe
+    at any scale, with zero impact on production traffic patterns.
+
+    1 project  = 1 API call regardless of service count.
+    1500 projects = 1500 total logging calls across the org.
+    """
+    from tools.traffic_analyzer import analyze_traffic_batch
+    return analyze_traffic_batch(
+        project_id=pid,
+        findings=project_findings,
         lookback_days=settings.TRAFFIC_LOOKBACK_DAYS,
     )
-    return finding, traffic
 
 
 def scan_project(p: dict, scan_resource: str) -> tuple[list, list]:
@@ -247,18 +256,33 @@ def main():
             print("Dry run complete. No changes made.")
             return
 
-    # Step 5: Traffic analysis — parallel
-    print(f"\nAnalyzing traffic for {len(all_findings)} finding(s)...")
+    # Step 5: Traffic analysis — 1 batch API call per project (quota safe)
+    # Groups findings by project, then fires ONE Cloud Logging query per project.
+    #
+    # Old approach: N services × 1 call = N calls per project → hits 60 req/min quota
+    # New approach: N services × 0 calls + 1 batch call = 1 call per project → safe
+    # Impact at org scale: 1500 projects = 1500 total logging calls (was 15,000+)
+    # Zero changes to scanned projects — single passive read only.
+    from collections import defaultdict
+    findings_by_project: dict = defaultdict(list)
+    for f in all_findings:
+        findings_by_project[f["project_id"]].append(f)
+
+    print(f"\nAnalyzing traffic for {len(all_findings)} finding(s) — 1 batch query per project ({len(findings_by_project)} projects)...")
     with ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_traffic, f): f for f in all_findings}
+        futures = {
+            executor.submit(fetch_traffic_for_project, pid, pfindings): pid
+            for pid, pfindings in findings_by_project.items()
+        }
         for future in as_completed(futures):
+            pid = futures[future]
             try:
-                finding, traffic = future.result()
-                finding.update(traffic)
-                rtype = _short_type(finding.get("resource_type", "cloud_run_service"))
-                print(f"✓ [{rtype}] {finding['name']} — {finding.get('request_count', 0)} requests | {finding.get('classification', 'Unknown')}")
+                enriched = future.result()
+                for f in enriched:
+                    rtype = _short_type(f.get("resource_type", "cloud_run_service"))
+                    print(f"✓ [{rtype}] {f['name']} — {f.get('request_count', 0)} requests | {f.get('classification', 'Unknown')}")
             except Exception as e:
-                print(f"✗ Traffic fetch failed — {e}")
+                print(f"✗ Traffic batch failed for {pid} — {e}")
 
     # Step 6: Deterministic risk classification — zero LLM cost
     print("\nClassifying risk levels...")
