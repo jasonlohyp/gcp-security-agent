@@ -72,7 +72,7 @@ orchestrator.py               <- ONE LLM call (narrative + pattern analysis)
 - `gcloud` CLI authenticated
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/gcp-security-agent.git
+git clone https://github.com/jasonlohyp/gcp-security-agent.git
 cd gcp-security-agent
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
