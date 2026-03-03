@@ -48,7 +48,10 @@ gcloud run services update {{ name }} \\
   --project {{ project_id }}
 {% endif %}
 
-# Step 4: (Recommended) Set up a Load Balancer with Cloud Armor
+# Step 4: (Recommended) Place service behind a Load Balancer
+# This restricts ingress to internal-and-cloud-load-balancing and enables
+# attachment of a security policy to the LB backend.
+# Note: Load Balancer security policy attachment is not validated by this scan — verify manually.
 # See: https://cloud.google.com/run/docs/securing/load-balancing
 """)
 
@@ -85,15 +88,14 @@ CR_MEDIUM_LB_BYPASS_TEMPLATE = Template("""
 # ============================================================
 
 # Step 1: Restrict ingress to internal-and-cloud-load-balancing
-# Forces all traffic through your Load Balancer (and Cloud Armor WAF)
-# preventing direct .run.app URL bypass attacks
+# Forces all traffic through your Load Balancer, preventing direct .run.app URL bypass attacks
 gcloud run services update {{ name }} \\
   --ingress internal-and-cloud-load-balancing \\
   --region {{ region }} \\
   --project {{ project_id }}
 
-# Step 2: Verify Cloud Armor policy is attached to your LB backend
-# See: https://cloud.google.com/armor/docs/configure-security-policies
+# Step 2: Verify a security policy is attached to your LB backend
+# Note: LB security policy attachment is not validated by this scan — check manually.
 """)
 
 CR_LOW_SHIELDED_TEMPLATE = Template("""
@@ -106,8 +108,10 @@ CR_LOW_SHIELDED_TEMPLATE = Template("""
 # Service is following enterprise standard configuration.
 # Recommended review actions:
 
-# 1. Verify Cloud Armor security policy is attached to your Load Balancer
-gcloud compute backend-services list --project {{ project_id }}
+# 1. Verify a security policy is attached to your Load Balancer backend
+# Note: LB security policy attachment is not validated by this scan — check manually.
+# 1. Verify a security policy is attached to your Load Balancer backend
+# Note: LB security policy attachment is not validated by this scan — check manually.
 
 # 2. Confirm IAM invoker bindings are scoped correctly
 gcloud run services get-iam-policy {{ name }} \\
@@ -257,8 +261,8 @@ gcloud functions deploy {{ name }} \\
   --region {{ region }} \\
   --project {{ project_id }}
 
-# Step 2: Verify Cloud Armor policy is attached to your LB backend
-# See: https://cloud.google.com/armor/docs/configure-security-policies
+# Step 2: Verify a security policy is attached to your LB backend
+# Note: LB security policy attachment is not validated by this scan — check manually.
 """)
 
 CF_LOW_INTERNAL_UNAUTH_TEMPLATE = Template("""
@@ -301,8 +305,10 @@ CF_LOW_SHIELDED_TEMPLATE = Template("""
 
 # Function is following enterprise standard configuration.
 
-# 1. Verify Cloud Armor security policy is attached to your Load Balancer
-gcloud compute backend-services list --project {{ project_id }}
+# 1. Verify a security policy is attached to your Load Balancer backend
+# Note: LB security policy attachment is not validated by this scan — check manually.
+# 1. Verify a security policy is attached to your Load Balancer backend
+# Note: LB security policy attachment is not validated by this scan — check manually.
 
 # 2. Confirm IAM invoker bindings are scoped correctly
 gcloud functions get-iam-policy {{ name }} \\

@@ -50,7 +50,7 @@ def _safe_scope(project_scope: str) -> str:
 
 
 def _output_dir() -> Path:
-    d = Path("output")
+    d = Path(settings.REPORT_OUTPUT_DIR)
     d.mkdir(exist_ok=True)
     return d
 
@@ -60,6 +60,11 @@ def _output_dir() -> Path:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_findings_context(findings: list[dict]) -> str:
+    """
+    Full per-finding detail for Gemini — used when findings < REPORT_LLM_FINDINGS_THRESHOLD.
+    Remediation scripts are intentionally excluded: they are pre-computed in Python and
+    rendered directly into HTML. Gemini does not need them and excluding them saves ~27% tokens.
+    """
     lines = []
     for f in findings:
         ld = f.get("lookback_days", settings.TRAFFIC_LOOKBACK_DAYS)
@@ -79,10 +84,81 @@ Service:              {f.get('name')}
   Risk Level:         {f.get('risk_level')}
   Triggered By:       {', '.join(f.get('triggered_dimensions', []))}
   Needs Remediation:  {f.get('needs_remediation')}
-  Remediation:
-{f.get('remediation', 'N/A')}
 """)
     return "\n---\n".join(lines)
+
+
+def _build_aggregate_context(findings: list[dict]) -> tuple[str, bool]:
+    """
+    Category-level aggregate context for Gemini — used when findings >= REPORT_LLM_FINDINGS_THRESHOLD.
+
+    Instead of sending thousands of individual service entries, groups findings by risk
+    category and produces compact statistical blocks. Gives Gemini identical analytical
+    quality (pattern detection, SA distribution, traffic trends) at a fraction of the tokens.
+
+    At 11 categories max this is always under 2,000 tokens regardless of org size.
+
+    Returns:
+        (context_str, is_aggregate) — is_aggregate=True signals the caller to show
+        the visible notice in the Smart Analysis section of the HTML report.
+    """
+    from collections import defaultdict
+
+    groups: dict = defaultdict(list)
+    for f in findings:
+        groups[f.get("risk_category", "Unknown")].append(f)
+
+    blocks = []
+    for category, group in sorted(groups.items(), key=lambda x: -len(x[1])):
+        count        = len(group)
+        zero_traffic = sum(1 for f in group if f.get("request_count", 0) == 0)
+        default_sa   = sum(1 for f in group if f.get("is_default_sa"))
+        custom_sa    = count - default_sa
+        unauth       = sum(1 for f in group if f.get("unauthenticated"))
+        gen1         = sum(1 for f in group if f.get("resource_type") == "cloud_function_gen1")
+
+        # Region distribution
+        region_counts: dict = defaultdict(int)
+        for f in group:
+            region_counts[f.get("region", "unknown")] += 1
+        regions_str = ", ".join(
+            f"{r} ({n})" for r, n in sorted(region_counts.items(), key=lambda x: -x[1])[:5]
+        )
+
+        # Sample service names (first 3)
+        sample_names = ", ".join(f.get("name", "") for f in group[:3])
+        if count > 3:
+            sample_names += f" ... ({count - 3} more)"
+
+        block = (
+            f"Risk Group: {category}\n"
+            f"  Count:          {count}\n"
+            f"  Unauthenticated:{unauth}/{count}\n"
+            f"  Zero traffic:   {zero_traffic}/{count}\n"
+            f"  Default SA:     {default_sa} | Custom SA: {custom_sa}\n"
+            f"  Gen1 functions: {gen1}\n"
+            f"  Regions:        {regions_str}\n"
+            f"  Sample names:   {sample_names}\n"
+        )
+        blocks.append(block)
+
+    context = "\n---\n".join(blocks)
+    return context, True
+
+
+def _select_findings_context(findings: list[dict]) -> tuple[str, bool]:
+    """
+    Routes to full detail or aggregate mode based on REPORT_LLM_FINDINGS_THRESHOLD.
+
+    Returns:
+        (context_str, is_aggregate)
+        is_aggregate=True  → report should show the large-scan notice
+        is_aggregate=False → full per-finding detail, no notice needed
+    """
+    threshold = settings.REPORT_LLM_FINDINGS_THRESHOLD
+    if len(findings) >= threshold:
+        return _build_aggregate_context(findings)
+    return _build_findings_context(findings), False
 
 
 def _build_summary_context(summary: dict, lookback_days: int) -> str:
@@ -106,7 +182,6 @@ def _call_gemini(
     findings: list[dict],
     summary: dict,
     project_scope: str,
-    user_prompt: str,
     vertex_project: str,
 ) -> dict:
     """
@@ -114,6 +189,11 @@ def _call_gemini(
       - executive_summary   : plain English summary (3–5 sentences)
       - smart_analysis      : list of pattern observations across findings
       - strategic_recs      : list of recommendations (project-team-actionable only)
+      - is_aggregate        : bool — True if aggregate mode was used (shown as notice in report)
+
+    Prompt strategy (tiered by REPORT_LLM_FINDINGS_THRESHOLD in .env):
+      Below threshold → full per-finding detail (no remediation block)
+      At/above threshold → category-level aggregates (always < 2k tokens, safe at org scale)
 
     All risk classification, remediation commands, and service lists are
     pre-computed in Python — Gemini only narrates and analyses patterns.
@@ -122,6 +202,16 @@ def _call_gemini(
     lookback = settings.TRAFFIC_LOOKBACK_DAYS
     if findings:
         lookback = findings[0].get("lookback_days", lookback)
+
+    # Select prompt mode — tiered based on finding count vs threshold
+    findings_context, is_aggregate = _select_findings_context(findings)
+    context_mode_note = (
+        f"NOTE: This scan contains {len(findings)} findings which exceeds the per-finding "
+        f"detail threshold ({settings.REPORT_LLM_FINDINGS_THRESHOLD}). "
+        f"Findings are provided as category-level aggregates. "
+        f"Your analysis should focus on category patterns, SA distribution, and traffic trends.\n\n"
+        if is_aggregate else ""
+    )
 
     system_prompt = f"""You are a GCP Cloud Security Analyst producing structured analysis for a security report.
 
@@ -140,7 +230,8 @@ STRICT RULES:
 - Always reference the actual traffic window ({lookback} days)
 - Zero-traffic services should always be flagged for potential decommission
 - If all services share the same issue, say so explicitly — one pattern is more useful than 40 repetitions
-- Smart analysis: look for naming patterns, ingress consistency, traffic anomalies, SA issues
+- Smart analysis: look for naming patterns, ingress consistency, traffic anomalies, SA distribution issues
+- If findings are provided as category aggregates, base your pattern analysis on the aggregate statistics
 
 Respond ONLY with valid JSON. No markdown fences. No preamble. Example structure:
 {{
@@ -157,7 +248,7 @@ Respond ONLY with valid JSON. No markdown fences. No preamble. Example structure
 
     user_message = f"""Analyse the following GCP security scan and return structured JSON.
 
-USER REQUEST: {user_prompt}
+{context_mode_note}TASK: Analyse GCP Cloud Run and Cloud Functions public exposure findings and return structured JSON.
 SCOPE: {project_scope}
 SCAN DATE: {datetime.now().strftime('%Y-%m-%d')}
 TRAFFIC WINDOW: {lookback} days
@@ -166,7 +257,7 @@ SUMMARY:
 {_build_summary_context(summary, lookback)}
 
 CLASSIFIED FINDINGS:
-{_build_findings_context(findings)}
+{findings_context}
 """
 
     client = genai.Client(
@@ -210,13 +301,16 @@ CLASSIFIED FINDINGS:
     raw = re.sub(r"```$", "", raw.strip())
 
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        result["is_aggregate"] = is_aggregate
+        return result
     except json.JSONDecodeError:
         logger.warning("Gemini returned non-JSON — using fallback analysis")
         return {
             "executive_summary": raw[:600] if raw else "Analysis unavailable.",
             "smart_analysis": [],
             "strategic_recs": [],
+            "is_aggregate": is_aggregate,
         }
 
 
@@ -392,6 +486,21 @@ def _build_project_report_html(
 
     # ── Smart Analysis — built ONCE from all notes, rendered as standalone section
     raw_notes = list(analysis.get("smart_analysis", []))
+    is_aggregate = analysis.get("is_aggregate", False)
+
+    aggregate_notice = ""
+    if is_aggregate:
+        aggregate_notice = (
+            "<div style=\"margin-bottom:10px;padding:8px 12px;"
+            "background:var(--badge-info-bg,#1e3a5f);border-left:3px solid #4a9eda;"
+            "border-radius:4px;font-size:13px;color:var(--badge-info-text,#90caf9);\">"
+            "&#8505;&#65039; Large scan detected — pattern analysis is based on "
+            f"category-level aggregates ({len(findings)} findings exceeded the "
+            f"{settings.REPORT_LLM_FINDINGS_THRESHOLD}-finding detail threshold). "
+            "Individual service names were not sent to the LLM."
+            "</div>"
+        )
+
     if raw_notes:
         notes_html = "".join(
             "<div>&bull; " + _md_to_html(n) + "</div>" for n in raw_notes
@@ -399,6 +508,7 @@ def _build_project_report_html(
         smart_analysis_html = (
             '<div class="smart-note">'
             '<div class="note-label">&#129504; Smart Analysis</div>'
+            + aggregate_notice
             + notes_html + "</div>"
         )
     else:
@@ -992,7 +1102,6 @@ def generate_and_save_reports(
     summary: dict,
     project_scope: str,
     scope_type: str,          # "project" | "folder" | "org"
-    user_prompt: str,
     vertex_project: str,
     scan_date: str | None = None,
 ) -> dict:
@@ -1029,7 +1138,6 @@ def generate_and_save_reports(
         findings=classified_findings,
         summary=summary,
         project_scope=project_scope,
-        user_prompt=user_prompt,
         vertex_project=vertex_project,
     )
 

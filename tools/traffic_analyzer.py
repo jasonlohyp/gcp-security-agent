@@ -8,7 +8,6 @@
 # Before: 50 services × 1 call = 50 calls per project → hits 60 req/min quota
 # After:  50 services × 0 calls + 1 batch call = 1 call per project → safe at any scale
 #
-# This avoids impacting production projects with burst logging read traffic.
 # Cloud Logging quota: 60 read requests per minute per project.
 # At 1 call per project this limit is never approached.
 
@@ -36,11 +35,12 @@ def analyze_traffic_batch(
     Args:
         project_id:    GCP project ID
         findings:      List of finding dicts for this project (from scanner)
-        lookback_days: Lookback window in days
+        lookback_days: Lookback window in days (default: TRAFFIC_LOOKBACK_DAYS from .env)
 
     Returns:
         Same findings list enriched with traffic data:
-        - request_count:      requests found within lookback window (capped at 500)
+        - request_count:      requests found within lookback window
+                              (capped at LOG_BATCH_MAX_RESULTS from .env)
         - last_request_date:  ISO date string of most recent request, or None
         - lookback_days:      actual window used
         - classification:     "Active" | "Inactive" | "Unknown"
@@ -78,16 +78,16 @@ def analyze_traffic_batch(
             f'AND timestamp>="{since_str}"'
         )
 
-        # Cap at 500 entries per project — enough for Active/Inactive classification
-        # across all services while keeping the single query lightweight
+        # Cap controlled by LOG_BATCH_MAX_RESULTS in .env — sufficient for
+        # Active/Inactive classification across all services while keeping
+        # the single query lightweight.
         entries = list(client.list_entries(
             filter_=log_filter,
             order_by=logging_v2.DESCENDING,
-            max_results=500,
+            max_results=settings.LOG_BATCH_MAX_RESULTS,
         ))
 
         # Distribute log entries back to findings by service name
-        # Build per-service counts and last-seen dates from the batch result
         service_counts: dict[str, int] = defaultdict(int)
         service_last_seen: dict[str, str] = {}
 
@@ -104,11 +104,11 @@ def analyze_traffic_batch(
 
         # Enrich each finding with its traffic data
         for f in findings:
-            name = f["name"]
+            name  = f["name"]
             count = service_counts.get(name, 0)
-            f["request_count"] = count
+            f["request_count"]     = count
             f["last_request_date"] = service_last_seen.get(name)
-            f["classification"] = "Active" if count > 0 else "Inactive"
+            f["classification"]    = "Active" if count > 0 else "Inactive"
 
     except Exception as e:
         logger.warning(
@@ -119,63 +119,3 @@ def analyze_traffic_batch(
             f["classification"] = "Unknown"
 
     return findings
-
-
-def analyze_traffic(
-    project_id: str,
-    service_name: str,
-    region: str,
-    lookback_days: int = settings.TRAFFIC_LOOKBACK_DAYS,
-) -> dict:
-    """
-    Single-service traffic lookup. Kept for backwards compatibility.
-    For multi-service projects use analyze_traffic_batch() instead.
-
-    Args:
-        project_id:    GCP project ID
-        service_name:  Cloud Run service name
-        region:        Cloud Run region
-        lookback_days: Lookback window in days
-
-    Returns:
-        dict with request_count, last_request_date, lookback_days, classification
-    """
-    result = {
-        "service_name": service_name,
-        "project_id": project_id,
-        "region": region,
-        "request_count": 0,
-        "last_request_date": None,
-        "lookback_days": lookback_days,
-        "classification": "Inactive",
-    }
-
-    try:
-        client = logging_v2.Client(project=project_id)
-        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        log_filter = (
-            f'resource.type="cloud_run_revision" '
-            f'AND logName="projects/{project_id}/logs/run.googleapis.com%2Frequests" '
-            f'AND resource.labels.service_name="{service_name}" '
-            f'AND resource.labels.location="{region}" '
-            f'AND timestamp>="{since_str}"'
-        )
-
-        entries = list(client.list_entries(
-            filter_=log_filter,
-            order_by=logging_v2.DESCENDING,
-            max_results=100,
-        ))
-
-        result["request_count"] = len(entries)
-        if entries:
-            result["last_request_date"] = entries[0].timestamp.strftime("%Y-%m-%d")
-        result["classification"] = "Active" if len(entries) > 0 else "Inactive"
-
-    except Exception as e:
-        logger.warning(f"Could not retrieve logs for {service_name}: {e}")
-        result["classification"] = "Unknown"
-
-    return result
